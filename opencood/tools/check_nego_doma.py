@@ -3,13 +3,42 @@ import argparse
 import ast
 import copy
 import importlib.util
+import hashlib
 import json
 import re
-import subprocess
 from pathlib import Path
 
 from opencood.tools.nego_protocol import (ROOT, STAGES, MODALITIES, BASE_SHA, active_members,
     config_root, digest, file_sha, lidar_path, read_yaml, validate_config, verify_lock, write_json)
+
+
+_NATIVE_INTEGRITY_FILES = {'opencood/tools/train_stamp_val_inf.py', 'opencood/tools/train_lsd.py', 'opencood/models/sub_modules/keyfeat_modules.py', 'opencood/tools/train_da.py', 'opencood/tools/val_distance.py', 'opencood/tools/train_nego_vanilla.py', 'opencood/tools/train_utils.py', 'opencood/tools/train_nego_vanilla_onlytrain_ddp.py', 'opencood/tools/train_nego_onlytrain.py', 'opencood/tools/train_nego.py', 'opencood/models/comm_modules/comm_in_pub.py', 'opencood/loss/nego_loss.py', 'opencood/tools/train_stamp_onlytrain.py', 'opencood/loss/nego_loss_ft.py', 'opencood/tools/find_best_ap50_and_save_bak.py', 'opencood/tools/train_da_ddp.py', 'opencood/tools/inference_nego.py', 'opencood/tools/train_nego_val_inf.py', 'opencood/tools/train.py', 'opencood/loss/nego_loss_align.py', 'opencood/tools/train_lsd_ddp.py'}
+_WANDB_CLEANED_FILES = {'opencood/tools/val_distance.py', 'opencood/tools/train_stamp_val_inf.py', 'opencood/tools/train_stamp_onlytrain.py', 'opencood/tools/find_best_ap50_and_save_bak.py', 'opencood/tools/train_lsd.py', 'opencood/tools/train_nego_vanilla_onlytrain_ddp.py', 'opencood/tools/train_nego_vanilla.py', 'opencood/tools/train_nego_onlytrain.py', 'opencood/tools/train_da_ddp.py', 'opencood/tools/train_lsd_ddp.py', 'opencood/tools/train_da.py', 'opencood/tools/train_nego.py', 'opencood/tools/train_nego_val_inf.py'}
+
+
+def _normalized_native_bytes(data, allow_wandb_assignment):
+    """Normalize line endings and at most one top-level literal W&B assignment."""
+    data = data.replace(b'\r\n', b'\n')
+    tree = ast.parse(data)
+    matches = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Subscript) and ast.unparse(target.value) == 'os.environ'
+            and isinstance(target.slice, ast.Constant) and target.slice.value == 'WANDB_API_KEY'
+            for target in node.targets
+        ):
+            if (not allow_wandb_assignment or node not in tree.body or len(node.targets) != 1
+                    or not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str)
+                    or node.lineno != node.end_lineno):
+                raise ValueError('Unexpected WANDB_API_KEY assignment form')
+            matches.append(node)
+    if len(matches) > 1:
+        raise ValueError('Multiple WANDB_API_KEY assignments')
+    if matches:
+        node = matches[0]
+        lines = data.splitlines(keepends=True)
+        data = b''.join(lines[:node.lineno - 1] + lines[node.end_lineno:])
+    return data
 
 
 def audit_sources():
@@ -27,15 +56,18 @@ def audit_sources():
         if '${yaml_file}' in text and not re.search(r'^\s*yaml_file=',text,re.M):
             invalid_shell.append(path.relative_to(ROOT).as_posix())
     original_unchanged=[]
-    for rel in ('opencood/tools/train.py','opencood/tools/train_nego_onlytrain.py','opencood/tools/inference_nego.py',
-                'opencood/tools/find_best_ap50_and_save_bak.py','opencood/tools/train_utils.py',
-                'opencood/models/comm_modules/comm_in_pub.py','opencood/models/sub_modules/keyfeat_modules.py',
-                'opencood/loss/nego_loss.py','opencood/loss/nego_loss_align.py','opencood/loss/nego_loss_ft.py'):
-        old=subprocess.check_output(['git','show',BASE_SHA+':'+rel],cwd=ROOT)
-        current=(ROOT/rel).read_bytes()
-        # checkout line endings are immaterial to algorithm preservation.
-        if old.replace(b'\r\n',b'\n') != current.replace(b'\r\n',b'\n'):
-            raise ValueError('Unexpected native algorithm change: '+rel)
+    manifest = json.loads((ROOT / 'opencood/tools/nego_native_sha256.json').read_text(encoding='utf-8'))
+    if manifest.get('schema_version') != 1 or manifest.get('baseline_commit') != BASE_SHA:
+        raise ValueError('Invalid native integrity manifest')
+    expected_paths = _NATIVE_INTEGRITY_FILES
+    if set(manifest['files']) != expected_paths:
+        raise ValueError('Native integrity manifest file set changed')
+    for rel, entry in manifest['files'].items():
+        if entry['normalize_wandb_assignment'] != (rel in _WANDB_CLEANED_FILES):
+            raise ValueError('Invalid native normalization policy: ' + rel)
+        actual = hashlib.sha256(_normalized_native_bytes((ROOT / rel).read_bytes(), entry['normalize_wandb_assignment'])).hexdigest()
+        if actual != entry['sha256']:
+            raise ValueError('Unexpected native algorithm change: ' + rel)
         original_unchanged.append(rel)
     return {'credential_locations':credentials,'invalid_yaml_shell_references':invalid_shell,
             'unchanged_native_files':original_unchanged,
