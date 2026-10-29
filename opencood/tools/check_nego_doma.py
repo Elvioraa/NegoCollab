@@ -16,6 +16,12 @@ _NATIVE_INTEGRITY_FILES = {'opencood/tools/train_stamp_val_inf.py', 'opencood/to
 _WANDB_CLEANED_FILES = {'opencood/tools/val_distance.py', 'opencood/tools/train_stamp_val_inf.py', 'opencood/tools/train_stamp_onlytrain.py', 'opencood/tools/find_best_ap50_and_save_bak.py', 'opencood/tools/train_lsd.py', 'opencood/tools/train_nego_vanilla_onlytrain_ddp.py', 'opencood/tools/train_nego_vanilla.py', 'opencood/tools/train_nego_onlytrain.py', 'opencood/tools/train_da_ddp.py', 'opencood/tools/train_lsd_ddp.py', 'opencood/tools/train_da.py', 'opencood/tools/train_nego.py', 'opencood/tools/train_nego_val_inf.py'}
 
 
+def _wandb_key_slice(node):
+    if isinstance(node, ast.Index):
+        node = node.value
+    return isinstance(node, ast.Constant) and node.value == 'WANDB_API_KEY'
+
+
 def _normalized_native_bytes(data, allow_wandb_assignment):
     """Normalize line endings and at most one top-level literal W&B assignment."""
     data = data.replace(b'\r\n', b'\n')
@@ -23,8 +29,10 @@ def _normalized_native_bytes(data, allow_wandb_assignment):
     matches = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Subscript) and ast.unparse(target.value) == 'os.environ'
-            and isinstance(target.slice, ast.Constant) and target.slice.value == 'WANDB_API_KEY'
+            isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute)
+            and isinstance(target.value.value, ast.Name) and target.value.value.id == 'os'
+            and target.value.attr == 'environ'
+            and _wandb_key_slice(target.slice)
             for target in node.targets
         ):
             if (not allow_wandb_assignment or node not in tree.body or len(node.targets) != 1
