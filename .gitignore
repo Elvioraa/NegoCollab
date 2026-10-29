@@ -1,0 +1,14 @@
+.local_deps/
+.test_tmp/
+__pycache__/
+.pytest_cache/
+dataset/
+checkpoints/
+opencood/logs/
+*.pth
+*.pt
+*.pyc
+logs/
+docs/DOMA_OPV2V_V2XSET_ADAPTATION.md
+docs/DOMA_OPV2V_V2XSET_PROTOCOL_CHECK.md
+docs/*.json

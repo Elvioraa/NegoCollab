@@ -1,0 +1,126 @@
+schema_version: 1
+dataset: v2xset
+base_sha: 8cd12e68549ab23109a691230990004a38402fef
+reference_doma_commit: ef19dd01fbbbe35b82956b37c7b1a5b4bbf1bfd8
+seed: 303
+reference_configs:
+  m1:
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\v2xset\MoreModality\DOMA\V2\stage1\m1.yaml
+    copy: docs/protocol_sources/v2xset/m1.yaml
+    sha256: 26ec1609b94ceaab3c249fc3f28e9d0d929c884b9b3edeeafbd2b2ec21bf0d0a
+    status: local_reference_only
+  m2:
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\v2xset\MoreModality\DOMA\V2\stage2\m2.yaml
+    copy: docs/protocol_sources/v2xset/m2.yaml
+    sha256: 181f3050e8ea801acb790e0a34e31e212b029f138a5769b94ebd353b9d753262
+    status: local_reference_only
+  m3:
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\v2xset\MoreModality\DOMA\V2\stage2\m3.yaml
+    copy: docs/protocol_sources/v2xset/m3.yaml
+    sha256: 6ad08e2c01000100c7aa66408cdb77b674ecc47937897cc81efe7e4030df3227
+    status: local_reference_only
+  m4:
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\v2xset\MoreModality\DOMA\V2\stage2\m4.yaml
+    copy: docs/protocol_sources/v2xset/m4.yaml
+    sha256: 788e54e39f804fae5a7f03d902bfeedddfc5dab90bd541d48fae20092bbbc5c9
+    status: local_reference_only
+  final:
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\v2xset\MoreModality\DOMA\V2\final_infer\m1m2m3m4.yaml
+    copy: docs/protocol_sources/v2xset/final.yaml
+    sha256: e9d85f8dbd57bb86221a9101f53d321d334f8bd8c14f594ba042e6ed9649f102
+    status: local_reference_only
+assignments:
+  training:
+    path: opencood/hypes_yaml/v2xset/doma_protocol_negocollab/assignments/v2xset_4modality.json
+    sha256: e0419118774117cfc78266a1a34bbd409fe3d28839fbccb8d6e5e657b445b2f6
+    scenarios: 58
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\modality_assign\v2xset_4modality.json
+    ordered_sha256: cdf369f4bb6724a57abd18dc772baee1beab73f8e67bd63b561a613d93bc6558
+  evaluation:
+    path: opencood/hypes_yaml/v2xset/doma_protocol_negocollab/assignments/v2xset_4modality_in_order.json
+    sha256: 52fea31dc9f18c67df7edf59ba2b90e1580856b2c23b8f325902ddc740a06cb6
+    scenarios: 19
+    origin: F:\zzuStudy\exp_gpt\DOMA\opencood\modality_assign\v2xset_4modality_in_order.json
+    ordered_sha256: adc3ea6f14b28a36c748035b9bc980d3122bef08fad8beab373cf07b6e4a2d6f
+splits:
+  root_dir: dataset/V2XSET/train
+  validate_dir: dataset/V2XSET/validate
+  test_dir: dataset/V2XSET/test
+sensor_policy:
+  m1: original PCD + PointPillar
+  m2: LSS EfficientNet
+  m3: original PCD + SECOND
+  m4: LSS Resnet101
+training:
+  comm_range: 70
+  max_cav: 5
+  canvas:
+  - -102.4
+  - -51.2
+  - -3
+  - 102.4
+  - 51.2
+  - 1
+  semantics: native homogeneous collaboration; no CodeAlign scene sharding
+evaluation:
+  range:
+  - -204.8
+  - -102.4
+  - -3
+  - 204.8
+  - 102.4
+  - 1
+  comm_range: 180
+  max_cav: 5
+  use_cav:
+  - 1
+  - 2
+  - 3
+  - 4
+  ego: m1
+  iou:
+  - 0.3
+  - 0.5
+  - 0.7
+  gt: all communication-range CAVs before input prefix cutoff; lidar labels
+  postprocess_source:
+    core_method: VoxelPostprocessor
+    gt_range: &id001
+    - -102.4
+    - -51.2
+    - -3
+    - 102.4
+    - 51.2
+    - 1
+    anchor_args:
+      cav_lidar_range: *id001
+      l: 3.9
+      w: 1.6
+      h: 1.56
+      r: &id002
+      - 0
+      - 90
+      feature_stride: 2
+      num: 2
+    target_args:
+      pos_threshold: 0.6
+      neg_threshold: 0.45
+      score_threshold: 0.2
+    order: hwl
+    max_num: 150
+    nms_thresh: 0.15
+    dir_args:
+      dir_offset: 0.7853
+      num_bins: 2
+      anchor_yaw: *id002
+  runtime_confirmation: SERVER_VALIDATION_REQUIRED
+scene_exclusions: []
+excluded_frames: []
+exclusion_note: Known broken OPV2V frame matches local DOMA. No V2XSet scene excluded;
+  camera-incomplete scene policy requires server DOMA ledger.
+split_counts: 'SERVER_REQUIRED: real datasets absent locally'
+server_validation_required:
+- actual split/frame and scene-exclusion ledger
+- DOMA final CLI/range/GT/postprocess
+- CUDA/spconv full perception forward/backward
+- trained checkpoints and final AP
