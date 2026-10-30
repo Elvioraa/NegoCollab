@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import os
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from opencood.tools.nego_protocol import (ROOT, MODALITIES, STAGES, assert_prefix, digest,
-    file_sha, prepare, read_yaml, seed_all, seed_worker, validate_config, verify_lock, write_json)
+    file_sha, prepare, read_yaml, seed_all, seed_worker, validate_config, validate_runtime_batch, verify_lock, write_json)
 from opencood.tools.nego_state import (atomic_save, cpu_state, initialize, load_stage, model_for,
     pack, restore_rng, rng_state, set_training, strict_load, trainable_key)
 
@@ -36,9 +37,13 @@ def to_device(value,device):
 
 
 def loader(dataset,cfg,train,generator):
+    collate = dataset.collate_batch_train if train else dataset.collate_batch_test
+    if train and cfg.get('nego', {}).get('multi_batch', {}).get('enabled', False):
+        from opencood.data_utils.datasets.nego_m1_batch import collate_m1_vectorized
+        collate = partial(collate_m1_vectorized, dataset.collate_batch_train)
     return DataLoader(dataset,batch_size=cfg['train_params']['batch_size'] if train else 1,
-          shuffle=train,drop_last=False,num_workers=cfg['train_params']['num_workers'] if train else 0,
-          collate_fn=dataset.collate_batch_train if train else dataset.collate_batch_test,
+          shuffle=train,drop_last=False,num_workers=cfg['train_params'].get('num_workers',0) if train else 0,
+          collate_fn=collate,
           worker_init_fn=seed_worker,generator=generator,persistent_workers=False,pin_memory=False)
 
 
@@ -143,6 +148,7 @@ def train(experiment,stage,resume=False):
     from tensorboardX import SummaryWriter
     cfg=read_yaml(Path(experiment)/stage/'config.yaml')
     validate_config(cfg)
+    validate_runtime_batch(cfg)
     if cfg['nego_protocol']['stage']!=stage or stage=='final_infer':
         raise ValueError('Wrong stage YAML')
     verify_lock(cfg['nego_protocol']['dataset'])
@@ -274,6 +280,7 @@ def smoke(experiment,stage):
     from opencood.data_utils.datasets.nego_protocol_dataset import build_protocol_dataset
     cfg=read_yaml(Path(experiment)/stage/'config.yaml')
     validate_config(cfg)
+    validate_runtime_batch(cfg)
     verify_lock(cfg['nego_protocol']['dataset'])
     if stage=='final_infer':
         raise ValueError('Use infer for final model checks')
@@ -306,6 +313,7 @@ def infer(experiment,use_cav):
     from opencood.data_utils.datasets.nego_protocol_dataset import build_protocol_dataset
     cfg=read_yaml(Path(experiment)/'final_infer/config.yaml')
     validate_config(cfg)
+    validate_runtime_batch(cfg)
     verify_lock(cfg['nego_protocol']['dataset'])
     device=require_cuda()
     ckpt=load_stage(Path(experiment)/'final_infer/assembled.pth',cfg=cfg,

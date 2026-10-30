@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -222,9 +223,31 @@ def validate_config(cfg):
     stage, dataset = p['stage'], p['dataset']
     if stage not in STAGES or dataset not in ('opv2v', 'v2xset'):
         raise ValueError('Unknown stage/dataset')
+    lock = verify_lock(dataset)
+    if any(cfg.get(k) != value for k, value in lock['splits'].items()):
+        raise ValueError('Dataset split differs from protocol lock')
+    if p.get('excluded_frames') != lock['excluded_frames'] or cfg.get('label_type') != 'lidar':
+        raise ValueError('Frame exclusions or ground truth source differs from protocol lock')
+    policy = lock['evaluation' if stage == 'final_infer' else 'training']
+    if cfg['train_params']['max_cav'] != policy['max_cav'] or cfg['comm_range'] != policy['comm_range']:
+        raise ValueError('CAV or communication policy differs from protocol lock')
     members = active_members(stage)
+    if stage.startswith('pretrain/'):
+        expected_mapping = dict.fromkeys(MODALITIES, members[0])
+    elif stage.startswith('alliance/'):
+        expected_mapping = {'m1': 'm1', 'm2': 'm1', 'm3': 'm2', 'm4': 'm2'}
+    elif stage == 'final_infer':
+        expected_mapping = dict(zip(MODALITIES, MODALITIES))
+    else:
+        member = stage.split('/')[0]
+        expected_mapping = {'m1': member, 'm2': member, 'm3': 'm1', 'm4': 'm2'}
+    if cfg['heter']['mapping_dict'] != expected_mapping:
+        raise ValueError('Incorrect stage modality mapping')
     args = cfg['model']['args']
     phase = p['phase']
+    expected_phase = 'pretrain' if stage.startswith('pretrain/') else ('inf' if stage == 'final_infer' else stage.split('/')[1])
+    if phase != expected_phase:
+        raise ValueError('Stage phase mismatch')
     expected_core = {'pretrain':'homo_collab','nego':'heter_nego_train',
                      'align':'heter_nego_train_align','ft':'heter_nego_inf','inf':'heter_nego_inf'}[phase]
     if cfg['model']['core_method']!=expected_core or args['stage']!=phase:
@@ -267,15 +290,80 @@ def validate_config(cfg):
         raise ValueError('Wrong beam policy')
     if p['parents'] != parents(stage) or p['seed'] != cfg['seed']:
         raise ValueError('DAG/seed mismatch')
-    if cfg['train_params']['batch_size'] != 1:
-        # Native inference/FT uses agent_modality_list[0] for the whole batch.
-        raise ValueError('This native FT/dataset contract is validated for batch_size=1 only')
+    validate_hyperparameters(cfg)
+    if stage.startswith('pretrain/'):
+        expected_canvas = read_yaml(ROOT / lock['reference_configs'][members[0]]['copy'])['cav_lidar_range']
+    elif stage == 'final_infer':
+        expected_canvas = lock['evaluation']['range']
+    else:
+        expected_canvas = lock['training']['canvas']
+    if cfg['cav_lidar_range'] != expected_canvas:
+        raise ValueError('Detection range differs from protocol')
+    expected_post = copy.deepcopy(lock['evaluation']['postprocess_source'])
+    def normalize_canvas(value):
+        if isinstance(value, dict):
+            for key in value:
+                if key in ('lidar_range', 'cav_lidar_range', 'gt_range'):
+                    value[key] = list(expected_canvas)
+                else:
+                    normalize_canvas(value[key])
+        elif isinstance(value, list):
+            for item in value:
+                normalize_canvas(item)
+    normalize_canvas(expected_post)
+    if cfg['postprocess'] != expected_post:
+        raise ValueError('Evaluation postprocess differs from protocol lock')
     if cfg['fusion']['args']['proj_first']:
         raise ValueError('Expected unprojected intermediate fusion')
     if stage == 'final_infer':
         if cfg['heter']['mapping_dict'] != dict(zip(MODALITIES, MODALITIES)) or cfg['heter']['ego_modality'] != 'm1':
             raise ValueError('Final inference requires m1 ego and identity mapping')
+        evaluation = lock['evaluation']
+        if cfg['cav_lidar_range'] != evaluation['range'] or cfg['comm_range'] != evaluation['comm_range']:
+            raise ValueError('Evaluation range differs from protocol lock')
     return True
+
+
+def validate_hyperparameters(cfg):
+    """Validate configuration values without claiming runtime batch compatibility."""
+    train = cfg['train_params']
+    for name, minimum in (('batch_size', 1), ('eval_batch_size', 1),
+                          ('num_workers', 0), ('eval_freq', 1), ('save_freq', 1)):
+        value = train.get(name, 0 if name == 'num_workers' else 1)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(name + ' must be a valid integer')
+    epochs = train['epoches']
+    minimum = 0 if cfg['nego_protocol']['stage'] == 'final_infer' else 1
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < minimum:
+        raise ValueError('epoches must be a valid integer')
+    optimizer = cfg['optimizer']
+    for name, value, positive in (('learning_rate', optimizer['lr'], True),
+                                  ('weight_decay', optimizer.get('args', {}).get('weight_decay', 0), False)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or (value <= 0 if positive else value < 0):
+            raise ValueError(name + ' must be finite and valid')
+    import torch.optim
+    cls = getattr(torch.optim, optimizer['core_method'], None)
+    if (not isinstance(cls, type) or not issubclass(cls, torch.optim.Optimizer)
+            or cls is torch.optim.Optimizer or cls is torch.optim.LBFGS):
+        raise ValueError('Unsupported optimizer')
+    if cfg['lr_scheduler']['core_method'] not in ('step', 'multistep', 'cosineannealwarm', 'exponential'):
+        raise ValueError('Unsupported scheduler')
+
+
+def validate_runtime_batch(cfg):
+    """Fail closed until the native mixed-sample model has been validated."""
+    train = cfg['train_params']
+    opt = cfg.get('nego', {}).get('multi_batch', {})
+    if not isinstance(opt, dict):
+        raise ValueError('multi_batch must be a mapping')
+    enabled = opt.get('enabled', False)
+    mode = opt.get('mode', 'native')
+    if not isinstance(enabled, bool) or (enabled and mode != 'vectorized') or (not enabled and mode != 'native'):
+        raise ValueError('Invalid multi_batch configuration')
+    if enabled and cfg['nego_protocol']['stage'] != 'pretrain/m1':
+        raise ValueError('Vectorized batches are restricted to m1 pretrain')
+    if (train['batch_size'] != 1 and not enabled) or train.get('eval_batch_size', 1) != 1:
+        raise ValueError('Runtime multi-batch compatibility is not validated; use batch size 1')
 
 
 def verify_lock(dataset):

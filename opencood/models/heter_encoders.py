@@ -44,6 +44,9 @@ class PointPillar(nn.Module):
                       'voxel_coords': voxel_coords,
                       'voxel_num_points': voxel_num_points}
 
+        if data_dict.get('nego_m1_vectorized', False):
+            batch_dict['nego_expected_cavs'] = int(data_dict['record_len'].sum().item())
+
         batch_dict = self.pillar_vfe(batch_dict)
         batch_dict = self.scatter(batch_dict)
         lidar_feature_2d = batch_dict['spatial_features'] # H0, W0
