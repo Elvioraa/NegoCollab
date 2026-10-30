@@ -143,6 +143,8 @@ def audit_data(dataset,frames_per_scene=0):
         assignment=assignments['evaluation' if key=='test_dir' else 'training']
         scenes=sorted(p for p in root.iterdir() if p.is_dir())
         frame_count=0
+        camera_frame_count=0
+        excluded_scene_frames={}
         audited=0
         cav_counts={}
         for scene in scenes:
@@ -152,6 +154,11 @@ def audit_data(dataset,frames_per_scene=0):
             ordered=list(assignment[scene.name])
             stamps=sorted(p.stem for p in (scene/ordered[0]).glob('*.yaml') if 'additional' not in p.name and (scene.name,p.stem) not in excluded)
             frame_count+=len(stamps)
+            omit_camera = dataset=='v2xset' and key=='root_dir' and scene.name=='2021_09_09_13_20_58'
+            if omit_camera:
+                excluded_scene_frames[scene.name]=len(stamps)
+            else:
+                camera_frame_count+=len(stamps)
             cav_counts[scene.name]=len(cavs)
             for stamp in (stamps[:frames_per_scene] if frames_per_scene else stamps):
                 audited+=1
@@ -165,7 +172,7 @@ def audit_data(dataset,frames_per_scene=0):
                         raise ValueError('Missing pose: '+str(metadata))
                     # Native pair training observes every modality at each CAV;
                     # test sensors also require the assigned actual member.
-                    members=MODALITIES if key!='test_dir' else (assignment[scene.name][cav],)
+                    members=(('m1','m3') if omit_camera else MODALITIES) if key!='test_dir' else (assignment[scene.name][cav],)
                     for member in members:
                         original=folder/(stamp+'.pcd')
                         if member in ('m1','m3'):
@@ -195,10 +202,14 @@ def audit_data(dataset,frames_per_scene=0):
                             for n in range(4):
                                 if 'camera'+str(n) not in meta:
                                     raise ValueError('Missing camera calibration: '+str(metadata))
-        counts[key]={'scenes':len(scenes),'frames':frame_count,'audited_frames':audited,'cav_counts':cav_counts}
+        counts[key]={'scenes':len(scenes),'frames':frame_count,'audited_frames':audited,'cav_counts':cav_counts,'camera_eligible_frames':camera_frame_count,'excluded_camera_scene_frames':excluded_scene_frames}
+    if dataset=='v2xset':
+        observed=(counts['root_dir']['frames'],counts['root_dir']['camera_eligible_frames'],counts['validate_dir']['frames'],counts['test_dir']['frames'])
+        if observed != (6694,6223,609,2834) or counts['root_dir']['excluded_camera_scene_frames'] != {'2021_09_09_13_20_58':471}:
+            raise ValueError('V2XSet frame counts differ from DOMA evidence: '+repr(observed))
     return {'status':'PASS' if not frames_per_scene else 'PASS_SAMPLED','splits':counts,
             'complete_sensor_decode_and_forward':'SERVER_REQUIRED','excluded_frames':list(map(list,excluded)),
-            'scene_exclusions':[]}
+            'scene_exclusions':lock.get('camera_incomplete_scenes',[])}
 
 
 def main():

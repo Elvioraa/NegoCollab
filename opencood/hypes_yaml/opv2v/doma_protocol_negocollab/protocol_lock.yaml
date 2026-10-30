@@ -7,38 +7,38 @@ reference_configs:
   m1:
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\opv2v\MoreModality\DOMA\V2_R2_TABLE4_EXT\history_snapshot.json#opencood/logs/DOMA_V2_R2_2GPU_LR1P414_SEED303/stage1/m1_base/config.yaml
     copy: docs/protocol_sources/opv2v/m1.yaml
-    sha256: 1eb7d17b7e1b56640f29c22dbbba4b3a9b995983de727d8a6c319aa79305711d
+    sha256: 053d2af5700d6b892595690fc1e29335f6da6208813d2107e3d11d7554599505
     status: saved_run_snapshot
   m2:
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\opv2v\MoreModality\DOMA\V2_R2_TABLE4_EXT\history_snapshot.json#opencood/logs/DOMA_V2_R2_2GPU_LR1P414_SEED303/stage2/m2_alignto_m1_lr0p0012/config.yaml
     copy: docs/protocol_sources/opv2v/m2.yaml
-    sha256: d19857f509e4db2f6a47fcac3146a3da17a1b3d0573f378ad515cb86a9b39627
+    sha256: 7b9a536373f334fd241f38127c3e7ba838522bf521d7330f166150c231c28ba3
     status: saved_run_snapshot
   m3:
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\opv2v\MoreModality\DOMA\V2_R2_TABLE4_EXT\history_snapshot.json#opencood/logs/DOMA_V2_R2_2GPU_LR1P414_SEED303/stage2/m3_alignto_m1_lr0p0030/config.yaml
     copy: docs/protocol_sources/opv2v/m3.yaml
-    sha256: 2efea274e87c18000bcbf190693483ced481cd336428466858ae3794d705884a
+    sha256: 4495ff89afb1659c646414d62664b3756f415f793afb975efdae3437a8beecfb
     status: saved_run_snapshot
   m4:
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\opv2v\MoreModality\DOMA\V2_R2_TABLE4_EXT\history_snapshot.json#opencood/logs/DOMA_V2_R2_2GPU_LR1P414_SEED303/stage2/m4_alignto_m1_lr0p0017/config.yaml
     copy: docs/protocol_sources/opv2v/m4.yaml
-    sha256: 5a590a9047edc6dbf1ba9770dbcc9e5726ea15844b2adf3edefab232c4c49d93
+    sha256: 0f3701cab2dd432a7306f6009f1a27b61ed50a4a48eab463feee08148d284a7f
     status: saved_run_snapshot
   final:
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\hypes_yaml\opv2v\MoreModality\DOMA\V2_R2_TABLE4_EXT\history_snapshot.json#opencood/logs/DOMA_V2_R2_2GPU_LR1P414_SEED303/final_infer/config.yaml
     copy: docs/protocol_sources/opv2v/final.yaml
-    sha256: 76e1b9d266db7d7ca7e97b96126914ce4e299c3c33b2a8291bd796dc58f86db8
+    sha256: 4d150d2471ac76713fad35c2eebe9f832f365033e271554868f68cde28e99d53
     status: saved_run_snapshot
 assignments:
   training:
     path: opencood/hypes_yaml/opv2v/doma_protocol_negocollab/assignments/opv2v_4modality.json
-    sha256: e8e7be993f6188a33ad790e25957f76b808c0dc36550a09acdca0b183e153c44
+    sha256: 2205cc036b90f5cbcf9d2ebdc69aea34a1840d3bb59ed3ef156b572df9867b70
     scenarios: 68
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\modality_assign\opv2v_4modality.json
     ordered_sha256: b609959927dc98cce118ce5e1f2f47dc547fe199793f2da4dd4d867de95f66c5
   evaluation:
     path: opencood/hypes_yaml/opv2v/doma_protocol_negocollab/assignments/opv2v_4modality_in_order.json
-    sha256: b0d83733eae09c6e69a72d867e6fd8131425f9cd9efb0beff96bbd8ea680ca0e
+    sha256: c697b3a88fa951d0dc1cbcf8c986d00a2dadc6ac4dbbef8e363a1d2506230647
     scenarios: 16
     origin: F:\zzuStudy\exp_gpt\DOMA\opencood\modality_assign\opv2v_4modality_in_order.json
     ordered_sha256: 511e5b9da152855d3f9992eabbd730b4ad4252655d5f6f1a88e33ea07884fa9d
@@ -126,3 +126,4 @@ server_validation_required:
 - DOMA final CLI/range/GT/postprocess
 - CUDA/spconv full perception forward/backward
 - trained checkpoints and final AP
+protocol_text_hash: sha256_lf_normalized

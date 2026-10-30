@@ -651,7 +651,7 @@ nego_protocol:
   - pretrain/m1
   - pretrain/m2
   protocol_lock: opencood/hypes_yaml/v2xset/doma_protocol_negocollab/protocol_lock.yaml
-  scene_exclusions: []
+  scene_exclusions: ['2021_09_09_13_20_58']
   excluded_frames: []
   budget_source: opencood/hypes_yaml/opv2v/NGCB/stage1/m1m2_pyramid.yaml#train_setting.nego
   checkpoint_selection: validate AP50

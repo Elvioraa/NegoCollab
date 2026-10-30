@@ -2,7 +2,7 @@
 .test_tmp/
 __pycache__/
 .pytest_cache/
-dataset/
+/dataset
 checkpoints/
 opencood/logs/
 *.pth

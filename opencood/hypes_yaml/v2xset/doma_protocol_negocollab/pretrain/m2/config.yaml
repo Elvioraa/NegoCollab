@@ -453,7 +453,7 @@ nego_protocol:
   new_members: []
   parents: []
   protocol_lock: opencood/hypes_yaml/v2xset/doma_protocol_negocollab/protocol_lock.yaml
-  scene_exclusions: []
+  scene_exclusions: ['2021_09_09_13_20_58']
   excluded_frames: []
   budget_source: opencood/hypes_yaml/opv2v/Homo/m1_pointpillar_pyramid.yaml
   checkpoint_selection: validate loss

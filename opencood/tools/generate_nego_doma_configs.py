@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 from opencood.tools.nego_protocol import (ROOT, BASE_SHA, MODALITIES, STAGES, active_members,
-                                         config_root, digest, file_sha, parents)
+                                         config_root, digest, text_protocol_sha, parents)
 
 
 def put(path, content):
@@ -60,7 +60,7 @@ def generate(reference):
             out = source_root / dataset / (m+'.yaml')
             put(out, content)
             refs[m] = yaml.safe_load(content)
-            provenance[m] = {'origin':origin, 'copy':out.relative_to(ROOT).as_posix(), 'sha256':file_sha(out),
+            provenance[m] = {'origin':origin, 'copy':out.relative_to(ROOT).as_posix(), 'sha256':text_protocol_sha(out),
                              'status':'saved_run_snapshot' if dataset=='opv2v' else 'local_reference_only'}
         assignments = {}
         for kind, suffix in (('training',''), ('evaluation','_in_order')):
@@ -70,7 +70,7 @@ def generate(reference):
             out = config_root(dataset) / 'assignments' / rel.name
             put(out, source.read_text(encoding='utf-8'))
             value = json.loads(out.read_text(encoding='utf-8'))
-            assignments[kind] = {'path':out.relative_to(ROOT).as_posix(), 'sha256':file_sha(out),
+            assignments[kind] = {'path':out.relative_to(ROOT).as_posix(), 'sha256':text_protocol_sha(out),
                                   'scenarios':len(value), 'origin':str(source),
                                   'ordered_sha256':digest(list((k,list(v.items())) for k,v in value.items()))}
         final = refs['final']
@@ -87,8 +87,8 @@ def generate(reference):
                 'evaluation':{'range':eval_canvas,'comm_range':180,'max_cav':5,'use_cav':[1,2,3,4],
                               'ego':'m1','iou':[0.3,0.5,0.7], 'gt':'all communication-range CAVs before input prefix cutoff; lidar labels',
                               'postprocess_source':final['postprocess'], 'runtime_confirmation':'SERVER_VALIDATION_REQUIRED'},
-                'scene_exclusions':[], 'excluded_frames':[['2021_08_20_21_10_24','000265']] if dataset=='opv2v' else [],
-                'exclusion_note':'Known broken OPV2V frame matches local DOMA. No V2XSet scene excluded; camera-incomplete scene policy requires server DOMA ledger.',
+                'protocol_text_hash':'sha256_lf_normalized', 'camera_incomplete_scenes':[{'scene_id': '2021_09_09_13_20_58', 'split': 'train', 'missing_sensor': 'camera3', 'cavs': ['11340', '11348', '11356', '11364'], 'frames_per_cav': 471, 'missing_camera3_files': 1884, 'reason': 'fourth camera absent for the scene', 'applicable_stages': 'all training stages with camera members', 'doma_behavior': 'V2XSETBaseDataset excludes scene when load_camera_file is true; LiDAR-only retains it', 'observed_frames': {'lidar_train': 6694, 'camera_train': 6223, 'validate': 609, 'test': 2834}}] if dataset=='v2xset' else [], 'scene_exclusions':[], 'excluded_frames':[['2021_08_20_21_10_24','000265']] if dataset=='opv2v' else [],
+                'exclusion_note':'Known broken OPV2V frame matches local DOMA. V2XSet audited camera-incomplete scene excluded from camera-containing training only.',
                 'split_counts':'SERVER_REQUIRED: real datasets absent locally',
                 'server_validation_required':['actual split/frame and scene-exclusion ledger', 'DOMA final CLI/range/GT/postprocess',
                                                'CUDA/spconv full perception forward/backward', 'trained checkpoints and final AP']}
@@ -189,7 +189,7 @@ def generate(reference):
                           'supervise_single':True,'pub':copy.deepcopy(negotiation['model']['args']['pub']), **models}},
                  'loss':loss, 'nego_protocol':{'dataset':dataset,'stage':stage,'phase':phase,'seed':303,'new_members':new,
                          'parents':parents(stage),'protocol_lock':(config_root(dataset)/'protocol_lock.yaml').relative_to(ROOT).as_posix(),
-                         'scene_exclusions':[],'excluded_frames':lock['excluded_frames'],'budget_source':budget_source,
+                         'scene_exclusions':(["2021_09_09_13_20_58"] if dataset=='v2xset' and not isfinal and any(v['sensor_type']=='camera' for v in data.values()) else []),'excluded_frames':lock['excluded_frames'],'budget_source':budget_source,
                          'checkpoint_selection':'validate AP50' if not pretrain else 'validate loss',
                          'batch_note':'batch=1 required by native mixed-ego FT; pretrain reduced from native batch=2 for CPU-reviewed contract'}}
             if pretrain:

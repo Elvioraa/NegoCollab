@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from opencood.tools.nego_protocol import ProtocolAdaptor, assert_prefix, lidar_path
+from opencood.tools.nego_protocol import ProtocolAdaptor, assert_prefix, lidar_path, train_scene_exclusions
 from opencood.utils.nego_pcd import read_pcd
 
 
@@ -40,10 +40,11 @@ def build_protocol_dataset(cfg, train=False):
             dataset=self.params['nego_protocol']['dataset']
             paired=self.params['fusion']['core_method']=='intermediateheterpair'
             excluded=set(tuple(x) for x in self.params['nego_protocol']['excluded_frames'])
+            excluded_scenes = train_scene_exclusions(self.params, self.train)
             for folder in self.scenario_folders:
                 folder=Path(folder)
-                if folder.name in self.params['nego_protocol']['scene_exclusions']:
-                    raise ValueError('Scene exclusions require an audited implementation and server ledger')
+                if folder.name in excluded_scenes:
+                    continue
                 scene=folder.name
                 cavs=sorted(p.name for p in folder.iterdir() if p.is_dir())
                 cavs=self.adaptor.reorder_cav_list(cavs,scene)[:self.max_cav]

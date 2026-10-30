@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import random
+import re
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -27,8 +28,64 @@ def file_sha(path):
     return h.hexdigest()
 
 
+def text_protocol_sha(path):
+    data = Path(path).read_bytes().replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+    return hashlib.sha256(data).hexdigest()
+
+
+class MetadataSafeLoader(yaml.SafeLoader):
+    """Restricted support for NumPy scalars found in V2XSet metadata."""
+
+
+def _numpy_tuple(loader, node):
+    return tuple(loader.construct_sequence(node, deep=True))
+
+
+def _numpy_dtype(loader, node):
+    value = loader.construct_mapping(node, deep=True)
+    if set(value) != {'args', 'state'}:
+        raise ValueError('Unexpected NumPy dtype structure')
+    args, state = value['args'], value['state']
+    if not isinstance(args, list) or len(args) != 3 or args[1:] != [False, True]:
+        raise ValueError('Unexpected NumPy dtype arguments')
+    if not isinstance(state, tuple) or len(state) != 8 or state[0] != 3 or state[1] not in ('<', '>', '=', '|') or state[2:] != (None, None, None, -1, -1, 0):
+        raise ValueError('Unexpected NumPy dtype state')
+    if not isinstance(args[0], str) or not re.fullmatch(r'[fiub][1248]', args[0]):
+        raise ValueError('Unsupported NumPy dtype name')
+    dtype = np.dtype(args[0])
+    if dtype.kind not in 'fiub' or dtype.itemsize not in (1, 2, 4, 8) or dtype.fields or dtype.subdtype:
+        raise ValueError('Unsupported NumPy dtype')
+    return dtype.newbyteorder(state[1])
+
+
+def _numpy_scalar(loader, node):
+    value = loader.construct_sequence(node, deep=True)
+    if len(value) != 2 or not isinstance(value[0], np.dtype) or not isinstance(value[1], bytes) or len(value[1]) != value[0].itemsize:
+        raise ValueError('Unexpected NumPy scalar structure')
+    return np.frombuffer(value[1], dtype=value[0], count=1)[0].item()
+
+
+MetadataSafeLoader.add_constructor('tag:yaml.org,2002:python/tuple', _numpy_tuple)
+MetadataSafeLoader.add_constructor('tag:yaml.org,2002:python/object/apply:numpy.dtype', _numpy_dtype)
+MetadataSafeLoader.add_constructor('tag:yaml.org,2002:python/object/apply:numpy.core.multiarray.scalar', _numpy_scalar)
+
+
 def read_yaml(path):
-    return yaml.safe_load(Path(path).read_text(encoding='utf-8'))
+    with Path(path).open('r', encoding='utf-8') as stream:
+        loader = MetadataSafeLoader(stream)
+        try:
+            return loader.get_single_data()
+        finally:
+            loader.dispose()
+
+
+def train_scene_exclusions(cfg, train):
+    policy = cfg['nego_protocol']
+    camera = any(x['sensor_type'] == 'camera' for x in cfg['heter']['modality_setting'].values())
+    expected = ['2021_09_09_13_20_58'] if policy['dataset'] == 'v2xset' and camera and policy['stage'] != 'final_infer' else []
+    if policy['scene_exclusions'] != expected:
+        raise ValueError('Unapproved scene exclusion configuration')
+    return set(expected if train else [])
 
 
 def write_json(path, value):
@@ -156,6 +213,7 @@ class ProtocolAdaptor:
 
 
 def validate_config(cfg):
+    train_scene_exclusions(cfg, True)
     p = cfg['nego_protocol']
     stage, dataset = p['stage'], p['dataset']
     if stage not in STAGES or dataset not in ('opv2v', 'v2xset'):
@@ -220,7 +278,7 @@ def verify_lock(dataset):
     lock = read_yaml(config_root(dataset) / 'protocol_lock.yaml')
     for entry in list(lock['reference_configs'].values()) + list(lock['assignments'].values()):
         path = ROOT / entry.get('copy', entry.get('path', ''))
-        if file_sha(path) != entry['sha256']:
+        if text_protocol_sha(path) != entry['sha256']:
             raise ValueError('Protocol source changed: ' + str(path))
     return lock
 
