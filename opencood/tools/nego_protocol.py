@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 import random
 import re
 from pathlib import Path, PurePosixPath
@@ -97,6 +98,9 @@ def write_json(path, value):
 def config_root(dataset):
     if dataset not in ('opv2v', 'v2xset'):
         raise ValueError(dataset)
+    override = os.environ.get('NEGO_PROTOCOL_CONFIG_ROOT')
+    if override:
+        return Path(override).resolve()
     return ROOT / 'opencood/hypes_yaml' / dataset / 'doma_protocol_negocollab'
 
 
@@ -276,6 +280,8 @@ def validate_config(cfg):
 
 def verify_lock(dataset):
     lock = read_yaml(config_root(dataset) / 'protocol_lock.yaml')
+    if lock.get('dataset') != dataset:
+        raise ValueError('Protocol lock dataset mismatch')
     for entry in list(lock['reference_configs'].values()) + list(lock['assignments'].values()):
         path = ROOT / entry.get('copy', entry.get('path', ''))
         if text_protocol_sha(path) != entry['sha256']:

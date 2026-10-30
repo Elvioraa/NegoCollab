@@ -93,3 +93,35 @@ def test_gitignore_matches_dataset_symlink(tmp_path):
     except OSError:pytest.skip('Directory symlink unavailable on this host')
     p=subprocess.run(['git','-C',str(tmp_path),'check-ignore','-v','dataset'],capture_output=True,text=True)
     assert p.returncode==0 and '/dataset' in p.stdout
+
+
+def test_protocol_lock_can_use_experiment_copy(tmp_path, monkeypatch):
+    import opencood.tools.nego_protocol as protocol
+    monkeypatch.setenv('NEGO_PROTOCOL_CONFIG_ROOT', str(tmp_path))
+    assert protocol.config_root('v2xset') == tmp_path.resolve()
+    with pytest.raises(FileNotFoundError):
+        protocol.verify_lock('v2xset')
+    (tmp_path/'protocol_lock.yaml').write_text('dataset: opv2v\nreference_configs: {}\nassignments: {}\n')
+    with pytest.raises(ValueError, match='dataset mismatch'):
+        protocol.verify_lock('v2xset')
+    (tmp_path/'protocol_lock.yaml').write_text('dataset: v2xset\nreference_configs: {}\nassignments: {}\n')
+    assert protocol.verify_lock('v2xset')['dataset'] == 'v2xset'
+
+
+def test_experiment_lock_checks_copied_sources(tmp_path, monkeypatch):
+    import opencood.tools.nego_protocol as protocol
+    original=tmp_path/'original'
+    copy=tmp_path/'experiment'
+    original.mkdir();copy.mkdir()
+    source=copy/'source.yaml';source.write_bytes(b'value: 1\n')
+    assignment=copy/'assignment.json';assignment.write_bytes(b'{"scene":{}}\n')
+    lock={'dataset':'v2xset','reference_configs':{'m1':{'copy':'experiment/source.yaml','sha256':protocol.text_protocol_sha(source)}},
+          'assignments':{'training':{'path':'experiment/assignment.json','sha256':protocol.text_protocol_sha(assignment)}}}
+    (copy/'protocol_lock.yaml').write_text(yaml.safe_dump(lock))
+    (original/'protocol_lock.yaml').write_text('invalid: true')
+    monkeypatch.setattr(protocol,'ROOT',tmp_path)
+    monkeypatch.setenv('NEGO_PROTOCOL_CONFIG_ROOT',str(copy))
+    assert protocol.verify_lock('v2xset')['dataset']=='v2xset'
+    source.write_bytes(b'value: 2\n')
+    with pytest.raises(ValueError,match='Protocol source changed'):
+        protocol.verify_lock('v2xset')
