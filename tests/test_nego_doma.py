@@ -308,7 +308,13 @@ def test_native_algorithm_forward_methods_unchanged_and_roles():
         assert forward(original)==forward(current)
     source=(ROOT/'opencood/models/heter_nego_inf.py').read_text(encoding='utf-8')
     method=next(n for n in ast.walk(ast.parse(source)) if isinstance(n,ast.FunctionDef) and n.name=='forward')
-    assert 'self.negotiator' not in ast.unparse(method)
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and node.attr.startswith('negotiator')
+        and isinstance(node.value, ast.Name)
+        and node.value.id == 'self'
+        for node in ast.walk(method)
+    )
 
 
 def test_summary_rejects_different_gt_or_frames(tmp_path):
