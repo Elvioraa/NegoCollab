@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import os
+import time
 from functools import partial
 from pathlib import Path
 
@@ -24,6 +25,19 @@ def parsed(cfg):
     return load_general_params(copy.deepcopy(cfg))
 
 
+def pretrained_parent_models(cfg):
+    """Explicit opt-in: independently construct each expected parent model."""
+    options=cfg.get('nego',{}).get('checkpoint',{})
+    if not isinstance(options,dict):
+        raise ValueError('checkpoint options must be a mapping')
+    enabled=options.get('allow_reviewed_pretrained',False)
+    if not isinstance(enabled,bool):
+        raise ValueError('allow_reviewed_pretrained must be boolean')
+    if not enabled:
+        return None
+    return lambda parent,parent_cfg: model_for(parsed(parent_cfg))
+
+
 def to_device(value,device):
     if isinstance(value,torch.Tensor):
         return value.to(device)
@@ -39,8 +53,9 @@ def to_device(value,device):
 def loader(dataset,cfg,train,generator):
     collate = dataset.collate_batch_train if train else dataset.collate_batch_test
     if train and cfg.get('nego', {}).get('multi_batch', {}).get('enabled', False):
-        from opencood.data_utils.datasets.nego_m1_batch import collate_m1_vectorized
-        collate = partial(collate_m1_vectorized, dataset.collate_batch_train)
+        from opencood.data_utils.datasets.nego_m1_batch import collate_pretrain_vectorized
+        collate = partial(collate_pretrain_vectorized, dataset.collate_batch_train,
+                          cfg['nego_protocol']['stage'].split('/')[1])
     return DataLoader(dataset,batch_size=cfg['train_params']['batch_size'] if train else 1,
           shuffle=train,drop_last=False,num_workers=cfg['train_params'].get('num_workers',0) if train else 0,
           collate_fn=collate,
@@ -76,14 +91,54 @@ def loss_for(model,criterion,batch,cfg,epoch):
     output['epoch']=epoch
     if phase=='pretrain':
         loss=criterion(output,ego['label_dict'])
+        vectorized=cfg.get('nego',{}).get('multi_batch',{}).get('enabled',False)
+        if vectorized:
+            detection_components=dict(getattr(criterion,'loss_dict',{}))
         if cfg['model']['args']['supervise_single']:
             loss=loss+criterion(output,ego['label_dict_single'],suffix='_single')*cfg['train_params'].get('single_weight',1)
+        if vectorized:
+            criterion.nego_loss_components={'detection':detection_components,'single':dict(getattr(criterion,'loss_dict',{}))}
         return loss
     return criterion(output,ego['label_dict'],ego['label_dict_single'])
 
 
 def stats_template():
     return {iou:{'tp':[],'fp':[],'score':[],'gt':0} for iou in (0.3,0.5,0.7)}
+
+
+def require_vectorized_supervision(batch, cfg):
+    """Reject batches on which none of the configured loss terms can train."""
+    ego = batch['ego']
+    args = cfg['loss']['args']
+    labels = ego['label_dict']
+    positive = bool((labels['pos_equal_one'] > 0).any())
+    negative = bool((labels['neg_equal_one'] > 0).any())
+    cls = args['cls']['weight'] != 0
+    reg = args['reg']['weight'] != 0
+    direction = args.get('dir', {}).get('weight', 0) != 0
+    iou = args.get('iou', {}).get('weight', 0) != 0
+    if (negative and cls) or (positive and (reg or direction or iou or
+                                            (cls and args['pos_cls_weight'] != 0))):
+        return
+    if cfg['model']['args']['supervise_single'] and cfg['train_params'].get('single_weight', 1) != 0:
+        import torch.nn.functional as F
+        single = ego['label_dict_single']
+        pos = (single['pos_equal_one'] > 0).any(dim=-1).unsqueeze(1).float()
+        neg = (single['neg_equal_one'] > 0).all(dim=-1).unsqueeze(1).float()
+        for scale, weight in zip(args['pyramid']['relative_downsample'], args['pyramid']['weight']):
+            if weight == 0:
+                continue
+            valid_pos = bool(F.max_pool2d(pos, scale).any()) and args['pos_cls_weight'] != 0
+            valid_neg = bool((1 - F.max_pool2d(1 - neg, scale)).any())
+            if valid_pos or valid_neg:
+                return
+    member = cfg['nego_protocol']['stage'].split('/')[1]
+    encoder = cfg['model']['args'][member]['encoder_args']
+    if encoder.get('depth_supervision', False) and args.get('depth', {}).get('weight', 0) != 0:
+        images = ego['inputs_' + member]['imgs']
+        if images.numel() and images.shape[-3] > 3:
+            return
+    raise ValueError('Vectorized batch has no enabled supervision')
 
 
 def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,checkpoint_sha=None):
@@ -154,20 +209,32 @@ def train(experiment,stage,resume=False):
     verify_lock(cfg['nego_protocol']['dataset'])
     device=require_cuda()
     stage_dir=Path(experiment)/stage
+    vectorized = cfg.get('nego', {}).get('multi_batch', {}).get('enabled', False)
+    log_freq = cfg.get('nego', {}).get('multi_batch', {}).get('log_every', 10)
+    if vectorized and (isinstance(log_freq, bool) or not isinstance(log_freq, int) or log_freq < 1):
+        raise ValueError('log_every must be a positive integer')
     if not resume and any(stage_dir.glob('*.pth')):
         raise FileExistsError('Existing checkpoint; use --resume for complete training state')
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(message)s',
                         handlers=[logging.FileHandler(stage_dir/'train.log',encoding='utf-8'),logging.StreamHandler()])
+    if vectorized:
+        log = logging.getLogger('nego.vectorized.' + stage)
+        log.setLevel(logging.INFO)
+        log.propagate = False
+        if not log.handlers:
+            for handler in (logging.FileHandler(stage_dir/'train.log', encoding='utf-8'), logging.StreamHandler()):
+                handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+                log.addHandler(handler)
     seed_all(cfg['seed'])
     generator=torch.Generator().manual_seed(cfg['seed'])
     runtime=parsed(cfg)
     model=model_for(runtime).to(device)
     if resume:
-        ckpt=load_stage(stage_dir/'last.pth',cfg=cfg,protocol_sha=file_sha(ROOT/cfg['nego_protocol']['protocol_lock']))
+        ckpt=load_stage(stage_dir/'last.pth',cfg=cfg,protocol_sha=file_sha(ROOT/cfg['nego_protocol']['protocol_lock']),mode='resume',model=model)
         strict_load(model,ckpt['model'])
         owners,provenance,common=ckpt['meta']['owners'],ckpt['meta']['parents'],ckpt['common_state']
     else:
-        owners,provenance,common=initialize(model,cfg,experiment)
+        owners,provenance,common=initialize(model,cfg,experiment,parent_models=pretrained_parent_models(cfg))
     trainable=set_training(model,cfg)
     write_json(stage_dir/'trainable_parameters.json',trainable)
     train_data=build_protocol_dataset(runtime,train=True)
@@ -184,6 +251,7 @@ def train(experiment,stage,resume=False):
     from opencood.tools.train_utils import setup_lr_schedular
     scheduler=setup_lr_schedular(cfg,optimizer,len(loader(train_data,cfg,True,generator)))
     start=0
+    global_step=0
     best=float('inf') if cfg['nego_protocol']['phase']=='pretrain' else float('-inf')
     if resume:
         state=ckpt['resume']
@@ -192,12 +260,13 @@ def train(experiment,stage,resume=False):
         restore_rng(state['rng'],generator)
         start=state['completed_epoch']
         best=ckpt['best']
+        global_step=state['global_step']
     frozen={k:v for k,v in cpu_state(model).items() if not trainable_key(k,cfg)}
     writer=SummaryWriter(str(stage_dir/'tensorboard'))
     write_json(stage_dir/'provenance.json',{'parents':provenance,'config_sha256':digest(cfg),
           'protocol_sha256':file_sha(ROOT/cfg['nego_protocol']['protocol_lock']),
           'code_sha256':__import__('opencood.tools.nego_state',fromlist=['code_hash']).code_hash(),
-          'torch':torch.__version__,'cuda':torch.version.cuda,'DDP':False})
+          'torch':torch.__version__,'cuda':torch.version.cuda,'DDP':False,'seed':cfg['seed']})
     for epoch in range(start,cfg['train_params']['epoches']):
         # Rebuild the random CAV/ego assignment identically on fresh run or resume.
         seed_all(cfg['seed']+epoch)
@@ -205,22 +274,38 @@ def train(experiment,stage,resume=False):
         train_data.reinitialize()
         set_training(model,cfg)
         losses=[]
-        for index,batch in enumerate(loader(train_data,cfg,True,generator)):
+        train_loader=loader(train_data,cfg,True,generator)
+        batch_start=time.perf_counter() if vectorized else None
+        for index,batch in enumerate(train_loader):
             if batch is None:
                 raise ValueError('Empty training sample')
-            if batch['ego']['object_bbx_mask'].sum()==0:
+            if not vectorized and batch['ego']['object_bbx_mask'].sum()==0:
                 continue  # Same empty-positive training skip as native trainer.
+            if vectorized:
+                require_vectorized_supervision(batch,cfg)
             batch=to_device(batch,device)
             optimizer.zero_grad(set_to_none=True)
             loss=loss_for(model,criterion,batch,cfg,epoch)
             if not torch.isfinite(loss):
                 raise FloatingPointError('Nonfinite native loss')
             loss.backward()
+            if vectorized and any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                raise FloatingPointError('Nonfinite gradient in vectorized training')
             optimizer.step()
+            global_step += 1
             losses.append(float(loss.detach()))
-            writer.add_scalar('train/loss',losses[-1],epoch*len(train_data)+index)
+            writer.add_scalar('train/loss',losses[-1],global_step if vectorized else epoch*len(train_data)+index)
             if cfg['lr_scheduler']['core_method']=='cosineannealwarm':
-                scheduler.step_update(epoch*len(train_data)+index)
+                scheduler.step_update(global_step if vectorized else epoch*len(train_data)+index)
+            if vectorized and (index % log_freq == 0 or index+1 == len(train_loader)):
+                elapsed=time.perf_counter()-batch_start
+                components=getattr(criterion,'nego_loss_components',{})
+                voxel_inputs=batch['ego'].get('inputs_'+stage.split('/')[1],{})
+                voxel_count=len(voxel_inputs['voxel_coords']) if 'voxel_coords' in voxel_inputs else 0
+                log.info('stage=%s epoch=%d batch=%d/%d actual_batch=%d cav_counts=%s voxels=%d loss=%.8g components=%s lr=%s batch_seconds=%.4f samples_per_second=%.4f gpu_allocated=%d gpu_reserved=%d optimizer_step=%d seed=%s',
+                         stage,epoch+1,index+1,len(train_loader),len(batch['ego']['record_len']),batch['ego']['record_len'].tolist(),voxel_count,losses[-1],components,optimizer.param_groups[0]['lr'],elapsed,len(batch['ego']['record_len'])/elapsed,torch.cuda.memory_allocated(),torch.cuda.memory_reserved(),global_step,cfg['seed'])
+            if vectorized:
+                batch_start=time.perf_counter()
         if not losses:
             raise ValueError('No trainable positive samples')
         if cfg['lr_scheduler']['core_method']!='cosineannealwarm':
@@ -249,13 +334,23 @@ def train(experiment,stage,resume=False):
             restore_rng(saved_rng,generator)
             if improved:
                 best=metric
-                atomic_save(stage_dir/'best.pth',pack(model,cfg,owners,provenance,common,epoch+1,best=best))
+                atomic_save(stage_dir/'best.pth',pack(model,cfg,owners,provenance,common,epoch+1,best=best,global_step=global_step))
+                if vectorized:
+                    log.info('checkpoint saved path=%s epoch=%d metric=%.8g',stage_dir/'best.pth',epoch+1,metric)
             writer.add_scalar('validate/selection_metric',metric,epoch+1)
             logging.info('epoch=%d train_loss=%.8g validate_metric=%.17g best=%.17g',epoch+1,np.mean(losses),metric,best)
-        payload=pack(model,cfg,owners,provenance,common,epoch+1,optimizer,scheduler,generator,best)
+            if vectorized:
+                log.info('stage=%s epoch=%d average_loss=%.8g validation=%.17g best=%.17g',stage,epoch+1,np.mean(losses),metric,best)
+        elif vectorized:
+            log.info('stage=%s epoch=%d average_loss=%.8g',stage,epoch+1,np.mean(losses))
+        payload=pack(model,cfg,owners,provenance,common,epoch+1,optimizer,scheduler,generator,best,global_step)
         atomic_save(stage_dir/'last.pth',payload)
+        if vectorized:
+            log.info('checkpoint saved path=%s epoch=%d optimizer_step=%d',stage_dir/'last.pth',epoch+1,global_step)
         if (epoch+1)%cfg['train_params']['save_freq']==0:
             atomic_save(stage_dir/f'epoch_{epoch+1}.pth',payload)
+            if vectorized:
+                log.info('checkpoint saved path=%s epoch=%d optimizer_step=%d',stage_dir/f'epoch_{epoch+1}.pth',epoch+1,global_step)
     writer.close()
 
 
@@ -268,7 +363,7 @@ def assemble(experiment):
         raise FileExistsError(out)
     seed_all(cfg['seed'])
     model=model_for(parsed(cfg))
-    owners,provenance,common=initialize(model,cfg,experiment)
+    owners,provenance,common=initialize(model,cfg,experiment,parent_models=pretrained_parent_models(cfg))
     if not common or not any(k.startswith('negotiator.') for k in common):
         raise ValueError('Missing negotiated common-space provenance')
     atomic_save(out,pack(model,cfg,owners,provenance,common,0))
@@ -289,7 +384,7 @@ def smoke(experiment,stage):
     generator=torch.Generator().manual_seed(cfg['seed'])
     runtime=parsed(cfg)
     model=model_for(runtime).to(device)
-    owners,provenance,common=initialize(model,cfg,experiment)
+    owners,provenance,common=initialize(model,cfg,experiment,parent_models=pretrained_parent_models(cfg))
     trainable=set_training(model,cfg)
     dataset=build_protocol_dataset(runtime,train=True)
     batch=next(iter(loader(dataset,cfg,True,generator)))
@@ -404,7 +499,13 @@ def main():
     if args.command=='prepare':
         prepare(args.dataset,args.experiment)
     elif args.command=='train':
-        train(args.experiment,args.stage,args.resume)
+        try:
+            train(args.experiment,args.stage,args.resume)
+        except Exception:
+            log = logging.getLogger('nego.vectorized.' + args.stage)
+            if log.handlers:
+                log.exception('stage=%s training failed', args.stage)
+            raise
     elif args.command=='smoke':
         smoke(args.experiment,args.stage)
     elif args.command=='assemble':

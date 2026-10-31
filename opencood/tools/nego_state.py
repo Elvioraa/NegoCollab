@@ -1,7 +1,9 @@
 """Strict stage ownership, source checks and complete epoch-boundary resume."""
 import copy
+import hashlib
 import importlib
 import random
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,15 @@ import torch
 from opencood.tools.nego_protocol import ROOT, MODALITIES, active_members, digest, file_sha, parents
 
 FORMAT='negocollab-doma-v1'
+# Reviewed e0 Linux checkout: default native model paths are unchanged by the
+# current opt-in pretraining patch. Any other source/current implementation must
+# be separately audited; hashes are not evidence of checkpoint authenticity.
+REVIEWED_PRETRAINED_COMPATIBILITY = {
+    '33ca2a8b10d5bd55847786734c0fbcf5d302e6679aec26513f5b102a6f49e7c3':
+        {'source_signature':'909f2af1da80ed8a9ba11f0eb597ce022dc91b053a06802360f304d954fb8ced',
+         'allowed_stages':{'pretrain/m1'},
+         'target_signatures':{'4d5457fa6bce5c7d2aff099131a739ce7a4e22e77e5037b843ec613d5c967509'}}
+}
 CODE_FILES=(
     'opencood/models/homo_collab.py','opencood/models/heter_nego_train.py',
     'opencood/models/heter_nego_train_align.py','opencood/models/heter_nego_inf.py',
@@ -28,6 +39,25 @@ def code_hash():
         files.update(p.relative_to(ROOT).as_posix() for p in (ROOT/directory).rglob('*.py'))
     files.add('opencood/hypes_yaml/yaml_utils.py')
     return digest({p:file_sha(ROOT/p) for p in sorted(files)})
+
+
+def model_implementation_signature():
+    files=set()
+    for directory in ('opencood/models','opencood/utils','opencood/data_utils'):
+        files.update(p.relative_to(ROOT).as_posix() for p in (ROOT/directory).rglob('*.py'))
+    files.add('opencood/hypes_yaml/yaml_utils.py')
+    def normalized_sha(path):
+        raw=path.read_bytes().replace(b'\r\n',b'\n').replace(b'\r',b'\n')
+        return hashlib.sha256(raw).hexdigest()
+    return digest({p:normalized_sha(ROOT/p) for p in sorted(files)})
+
+
+def source_revision():
+    try:
+        return subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],
+                                       stderr=subprocess.DEVNULL,timeout=3,text=True).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def model_for(cfg, inference=False):
@@ -100,7 +130,7 @@ def cpu_state(model):
     return {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
 
 
-def strict_load(model,state):
+def validate_model_state(model,state):
     expected=model.state_dict()
     if set(expected)!=set(state):
         raise ValueError('State key mismatch; missing='+repr(sorted(set(expected)-set(state)))+
@@ -110,10 +140,20 @@ def strict_load(model,state):
             raise ValueError('State shape/dtype mismatch: '+k)
         if state[k].is_floating_point() and not torch.isfinite(state[k]).all():
             raise ValueError('Nonfinite checkpoint tensor: '+k)
+
+
+def strict_load(model,state):
+    validate_model_state(model,state)
     model.load_state_dict(state,strict=True)
 
 
-def load_stage(path,cfg=None,dataset=None,stage=None,protocol_sha=None):
+def load_stage(path,cfg=None,dataset=None,stage=None,protocol_sha=None,mode='exact',model=None,target_cfg=None):
+    if mode not in ('exact','resume','pretrained'):
+        raise ValueError('Unknown checkpoint loading mode')
+    if mode in ('resume','pretrained') and (cfg is None or model is None or protocol_sha is None):
+        raise ValueError('Explicit loading mode requires configuration, model, and protocol provenance')
+    if mode=='pretrained' and target_cfg is None:
+        raise ValueError('Pretrained loading requires explicit target model configuration')
     path=Path(path)
     if not path.is_file():
         raise FileNotFoundError('Missing required stage checkpoint: '+str(path))
@@ -132,11 +172,51 @@ def load_stage(path,cfg=None,dataset=None,stage=None,protocol_sha=None):
             raise ValueError('Checkpoint '+key+' mismatch: '+str(path))
     if cfg and meta['config_sha']!=digest(cfg):
         raise ValueError('Checkpoint config mismatch: '+str(path))
-    if meta['code_sha']!=code_hash():
-        raise ValueError('Checkpoint implementation hash differs; audit/migrate explicitly: '+str(path))
+    if 'experiment_config_sha' in meta and meta['experiment_config_sha']!=meta['config_sha']:
+        raise ValueError('Checkpoint experiment configuration metadata mismatch')
+    if mode=='pretrained' and (digest(cfg['model'])!=digest(target_cfg['model']) or model_identity(cfg)!=model_identity(target_cfg)):
+        raise ValueError('Pretrained target model configuration or identity mismatch')
     if meta['state_schema']!=digest({k:[list(v.shape),str(v.dtype)] for k,v in ckpt['model'].items()}):
         raise ValueError('Corrupt state schema')
+    current_code=code_hash()
+    if meta['code_sha']!=current_code:
+        signature=model_implementation_signature()
+        declaration=REVIEWED_PRETRAINED_COMPATIBILITY.get(meta['code_sha'],{})
+        if (mode!='pretrained' or meta['stage'] not in declaration.get('allowed_stages',set())
+                or signature not in declaration.get('target_signatures',set())
+                or ('model_implementation_signature' in meta
+                    and meta['model_implementation_signature']!=declaration.get('source_signature'))):
+            raise ValueError('Checkpoint implementation hash differs; audit/migrate explicitly: '+str(path))
+    if mode in ('resume','pretrained'):
+        if model.__class__.__name__.lower()!=cfg['model']['core_method'].replace('_','').lower():
+            raise ValueError('Checkpoint target model type mismatch')
+        validate_model_state(model,ckpt['model'])
+        if 'model_config_sha' in meta and meta['model_config_sha']!=digest(cfg['model']):
+            raise ValueError('Checkpoint model configuration mismatch')
+        if 'model_identity' in meta and meta['model_identity']!=model_identity(cfg):
+            raise ValueError('Checkpoint model identity mismatch')
+        if 'model_implementation_signature' in meta and meta['code_sha']==current_code and meta['model_implementation_signature']!=model_implementation_signature():
+            raise ValueError('Checkpoint model implementation mismatch')
+    if mode=='resume':
+        state=ckpt.get('resume',{})
+        if not all(k in state for k in ('optimizer','scheduler','rng','completed_epoch','global_step')):
+            raise ValueError('Checkpoint lacks complete resume state')
+        if (isinstance(state['completed_epoch'],bool) or not isinstance(state['completed_epoch'],int)
+                or state['completed_epoch']<0 or state['completed_epoch']!=meta['completed_epoch']
+                or isinstance(state['global_step'],bool) or not isinstance(state['global_step'],int) or state['global_step']<0
+                or meta.get('global_step')!=state['global_step']
+                or not isinstance(state['optimizer'],dict) or not isinstance(state['scheduler'],dict) or not isinstance(state['rng'],dict)):
+            raise ValueError('Invalid checkpoint resume epoch/global_step')
+        if (not {'state','param_groups'}.issubset(state['optimizer'])
+                or not isinstance(state['optimizer']['param_groups'],list) or not state['optimizer']['param_groups']
+                or not state['scheduler'] or not {'python','numpy','torch','cuda','generator'}.issubset(state['rng'])):
+            raise ValueError('Invalid checkpoint optimizer/scheduler/RNG state')
     return ckpt
+
+
+def model_identity(cfg):
+    stage=cfg['nego_protocol']['stage']
+    return {'core_method':cfg['model']['core_method'],'members':active_members(stage),'stage':stage}
 
 
 def source_for(key,stage):
@@ -162,7 +242,7 @@ def source_for(key,stage):
     raise ValueError(stage)
 
 
-def initialize(model,cfg,experiment):
+def initialize(model,cfg,experiment,parent_models=None):
     p=cfg['nego_protocol']
     stage=p['stage']
     protocol_sha=file_sha(ROOT/p['protocol_lock'])
@@ -173,7 +253,18 @@ def initialize(model,cfg,experiment):
         parent_cfg=read_yaml(parent_cfg_path)
         if parent_cfg['nego_protocol']['stage']!=parent or parent_cfg['nego_protocol']['dataset']!=p['dataset']:
             raise ValueError('Wrong parent config identity: '+parent)
-        loaded[parent]=load_stage(Path(experiment)/parent/'best.pth',cfg=parent_cfg,protocol_sha=protocol_sha)
+        if parent_models is None:
+            loaded[parent]=load_stage(Path(experiment)/parent/'best.pth',cfg=parent_cfg,protocol_sha=protocol_sha)
+        else:
+            if callable(parent_models):
+                expected_parent=parent_models(parent,parent_cfg)
+            else:
+                if parent not in parent_models:
+                    raise ValueError('Missing expected parent model: '+parent)
+                expected_parent=parent_models[parent]
+            loaded[parent]=load_stage(Path(experiment)/parent/'best.pth',cfg=parent_cfg,protocol_sha=protocol_sha,
+                                      mode='pretrained',model=expected_parent,target_cfg=parent_cfg)
+            del expected_parent
     state=cpu_state(model)
     owners={}
     for key,tensor in state.items():
@@ -219,18 +310,23 @@ def restore_rng(state,generator):
     generator.set_state(state['generator'])
 
 
-def pack(model,cfg,owners,provenance,common,epoch,optimizer=None,scheduler=None,generator=None,best=None):
+def pack(model,cfg,owners,provenance,common,epoch,optimizer=None,scheduler=None,generator=None,best=None,global_step=None):
     state=cpu_state(model)
     if cfg['nego_protocol']['stage']=='alliance/nego':
         common={k:v for k,v in state.items() if k.startswith(('negotiator.','nego_reziser_','occ_head_nego.'))}
     meta={'format':FORMAT,'dataset':cfg['nego_protocol']['dataset'],'stage':cfg['nego_protocol']['stage'],
           'config_sha':digest(cfg),'code_sha':code_hash(),'protocol_sha':file_sha(ROOT/cfg['nego_protocol']['protocol_lock']),
           'seed':cfg['seed'],'state_schema':digest({k:[list(v.shape),str(v.dtype)] for k,v in state.items()}),
-          'owners':owners,'parents':provenance,'completed_epoch':epoch}
+          'owners':owners,'parents':provenance,'completed_epoch':epoch,
+          'source_revision':source_revision(), 'model_identity':model_identity(cfg),
+          'model_config_sha':digest(cfg['model']), 'experiment_config_sha':digest(cfg),
+          'model_implementation_signature':model_implementation_signature(), 'global_step':global_step}
     result={'meta':meta,'model':state,'common_state':common,'best':best}
     if optimizer is not None:
         result['resume']={'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict(),
                           'rng':rng_state(generator),'completed_epoch':epoch}
+        if global_step is not None:
+            result['resume']['global_step'] = global_step
     return result
 
 

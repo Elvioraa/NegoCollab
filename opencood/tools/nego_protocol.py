@@ -288,8 +288,11 @@ def validate_config(cfg):
     beam = {'m3': 32} if dataset == 'opv2v' and 'm3' in members else {}
     if cfg['heter'].get('lidar_channels_dict', {}) != beam:
         raise ValueError('Wrong beam policy')
-    if p['parents'] != parents(stage) or p['seed'] != cfg['seed']:
-        raise ValueError('DAG/seed mismatch')
+    if p['parents'] != parents(stage):
+        raise ValueError('DAG mismatch')
+    seed = cfg['seed']
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
+        raise ValueError('Top-level seed must be a valid NumPy seed')
     validate_hyperparameters(cfg)
     if stage.startswith('pretrain/'):
         expected_canvas = read_yaml(ROOT / lock['reference_configs'][members[0]]['copy'])['cav_lidar_range']
@@ -360,8 +363,8 @@ def validate_runtime_batch(cfg):
     mode = opt.get('mode', 'native')
     if not isinstance(enabled, bool) or (enabled and mode != 'vectorized') or (not enabled and mode != 'native'):
         raise ValueError('Invalid multi_batch configuration')
-    if enabled and cfg['nego_protocol']['stage'] != 'pretrain/m1':
-        raise ValueError('Vectorized batches are restricted to m1 pretrain')
+    if enabled and cfg['nego_protocol']['stage'] not in tuple('pretrain/' + m for m in MODALITIES):
+        raise ValueError('Vectorized batches are restricted to pretraining')
     if (train['batch_size'] != 1 and not enabled) or train.get('eval_batch_size', 1) != 1:
         raise ValueError('Runtime multi-batch compatibility is not validated; use batch size 1')
 
