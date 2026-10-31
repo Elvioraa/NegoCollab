@@ -15,6 +15,13 @@ from opencood.tools.run_nego_doma import criterion_for, loader, loss_for, parsed
 
 
 STAGES = ('pretrain/m1', 'pretrain/m2', 'pretrain/m3', 'pretrain/m4')
+EXPECTED_UNUSED_M2 = frozenset({
+    'encoder_m2.camencode.trunk._conv_head.weight',
+    'encoder_m2.camencode.trunk._bn1.weight',
+    'encoder_m2.camencode.trunk._bn1.bias',
+    'encoder_m2.camencode.trunk._fc.weight',
+    'encoder_m2.camencode.trunk._fc.bias',
+})
 
 
 def check_config(cfg, stage, batch_size):
@@ -100,6 +107,10 @@ def run_update(model, criterion, cfg, batch, stage):
         params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
         if not params:
             raise ValueError('No trainable parameters')
+        expected_unused = EXPECTED_UNUSED_M2 if stage == 'pretrain/m2' else frozenset()
+        absent = expected_unused - {name for name, _ in params}
+        if absent:
+            raise ValueError('Expected unused parameters missing from trainable model: ' + ', '.join(sorted(absent)))
         options = cfg['optimizer']
         optimizer = getattr(torch.optim, options['core_method'])(
             [p for _, p in params], lr=options['lr'], **options.get('args', {}))
@@ -123,13 +134,17 @@ def run_update(model, criterion, cfg, batch, stage):
         if stage == 'pretrain/m3' and sparse_sizes != [int(batch['ego']['record_len'].sum())]:
             raise ValueError('SECOND sparse batch size does not match actual CAV count')
         loss.backward()
-        missing = [name for name, p in params if p.grad is None]
+        unused = sorted(name for name, p in params if p.grad is None and name in expected_unused)
+        missing = [name for name, p in params if p.grad is None and name not in expected_unused]
         if missing:
-            raise ValueError('Missing trainable gradients: ' + ', '.join(missing))
-        if any(not torch.isfinite(p.grad).all() for _, p in params):
+            raise ValueError('Unexpected missing trainable gradients: ' + ', '.join(missing))
+        gradients = [(name, p) for name, p in params if p.grad is not None]
+        if not gradients:
+            raise ValueError('No trainable gradients')
+        if any(not torch.isfinite(p.grad).all() for _, p in gradients):
             raise FloatingPointError('Nonfinite trainable gradient')
         gradient_norm = 0.0
-        for _, p in params:
+        for _, p in gradients:
             gradient_norm = math.hypot(gradient_norm, float(torch.linalg.vector_norm(p.grad.detach())))
         if not math.isfinite(gradient_norm):
             raise FloatingPointError('Nonfinite gradient norm')
@@ -139,6 +154,7 @@ def run_update(model, criterion, cfg, batch, stage):
         elapsed = time.perf_counter() - start
         updated = 0
         updated_elements = 0
+        updated_with_gradient = 0
         for name, parameter in params:
             current = parameter.detach().cpu()
             if not torch.isfinite(current).all():
@@ -146,12 +162,15 @@ def run_update(model, criterion, cfg, batch, stage):
             changed = int(torch.count_nonzero(current != before[name]))
             updated += int(changed > 0)
             updated_elements += changed
-        if not updated:
-            raise ValueError('Optimizer did not update any trainable parameter')
+            if parameter.grad is not None and changed:
+                updated_with_gradient += 1
+        if not updated_with_gradient:
+            raise ValueError('Optimizer did not update any gradient-bearing parameter')
         report = {'loss': float(loss.detach()), 'output_shapes': shapes,
                   'trainable_parameter_tensors': len(params),
                   'trainable_parameter_count': sum(p.numel() for _, p in params),
-                  'gradient_tensor_count': len(params), 'gradient_norm': gradient_norm,
+                  'gradient_tensor_count': len(gradients), 'gradient_norm': gradient_norm,
+                  'unused_trainable_parameters': unused,
                   'updated_parameter_tensors': updated, 'updated_parameter_count': updated_elements,
                   'optimizer': options['core_method'],
                   'learning_rates': [group['lr'] for group in optimizer.param_groups],

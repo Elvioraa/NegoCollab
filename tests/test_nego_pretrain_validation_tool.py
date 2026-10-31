@@ -119,3 +119,69 @@ def test_failure_does_not_create_checkpoint(tmp_path, synthetic_cuda_metrics):
         tool.run_update(SyntheticModel(), criterion, cfg, batch, 'pretrain/m1')
     assert not list(tmp_path.rglob('*.pth'))
     assert not list(tmp_path.rglob('*.pt'))
+
+
+class SyntheticEfficientNetModel(SyntheticModel):
+    def __init__(self, extra_unused=False):
+        super().__init__()
+        self.encoder_m2 = torch.nn.Module()
+        self.encoder_m2.camencode = torch.nn.Module()
+        self.encoder_m2.camencode.trunk = torch.nn.Module()
+        trunk = self.encoder_m2.camencode.trunk
+        trunk._conv_head = torch.nn.Linear(1, 1, bias=False)
+        trunk._bn1 = torch.nn.BatchNorm1d(1)
+        trunk._fc = torch.nn.Linear(1, 1)
+        self.encoder_m3 = torch.nn.Module()
+        self.encoder_m3.spconv_block = torch.nn.Identity()
+        if extra_unused:
+            self.unexpected_unused = torch.nn.Parameter(torch.tensor(3.0))
+
+    def forward(self, ego):
+        self.encoder_m3.spconv_block({'batch_size': int(ego['record_len'].sum())})
+        return super().forward(ego)
+
+
+def test_m2_exact_unused_parameters_and_gradient_update(synthetic_cuda_metrics):
+    cfg, batch = update_inputs()
+    model = SyntheticEfficientNetModel()
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+    report = tool.run_update(model, criterion, cfg, batch, 'pretrain/m2')
+    assert report['unused_trainable_parameters'] == sorted(tool.EXPECTED_UNUSED_M2)
+    assert report['trainable_parameter_tensors'] == 6
+    assert report['gradient_tensor_count'] == 1
+    assert report['gradient_norm'] == pytest.approx(2.0)
+    assert report['updated_parameter_tensors'] == 1
+    assert not torch.equal(before['weight'], model.weight.detach())
+    for name, param in model.named_parameters():
+        if name in tool.EXPECTED_UNUSED_M2:
+            assert param.grad is None
+            assert torch.equal(before[name], param.detach())
+
+
+def test_m2_unexpected_missing_gradient_is_rejected(synthetic_cuda_metrics):
+    cfg, batch = update_inputs()
+    with pytest.raises(ValueError, match='Unexpected missing.*unexpected_unused'):
+        tool.run_update(SyntheticEfficientNetModel(extra_unused=True), criterion, cfg, batch, 'pretrain/m2')
+
+
+@pytest.mark.parametrize('stage', ['pretrain/m1', 'pretrain/m3', 'pretrain/m4'])
+def test_other_stages_do_not_allow_m2_unused_parameters(stage, synthetic_cuda_metrics):
+    cfg, batch = update_inputs()
+    with pytest.raises(ValueError, match='Unexpected missing.*encoder_m2'):
+        tool.run_update(SyntheticEfficientNetModel(), criterion, cfg, batch, stage)
+
+
+def test_m2_expected_parameters_must_be_trainable(synthetic_cuda_metrics):
+    cfg, batch = update_inputs()
+    model = SyntheticEfficientNetModel()
+    model.encoder_m2.camencode.trunk._fc.bias.requires_grad_(False)
+    with pytest.raises(ValueError, match='missing from trainable model.*_fc.bias'):
+        tool.run_update(model, criterion, cfg, batch, 'pretrain/m2')
+
+
+def test_m2_nonfinite_gradient_still_fails(synthetic_cuda_metrics):
+    cfg, batch = update_inputs()
+    model = SyntheticEfficientNetModel()
+    model.weight.register_hook(lambda gradient: torch.full_like(gradient, float('inf')))
+    with pytest.raises(FloatingPointError, match='Nonfinite trainable gradient'):
+        tool.run_update(model, criterion, cfg, batch, 'pretrain/m2')
