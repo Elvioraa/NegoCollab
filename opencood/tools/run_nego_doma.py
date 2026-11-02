@@ -15,7 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from opencood.tools.nego_protocol import (ROOT, MODALITIES, STAGES, assert_prefix, digest,
-    file_sha, prepare, read_yaml, seed_all, seed_worker, validate_config, validate_runtime_batch, verify_lock, write_json)
+    file_sha, prepare, read_yaml, seed_all, seed_everything, seed_worker, validate_config,
+    validate_runtime_batch, verify_lock, write_json)
 from opencood.tools.nego_state import (atomic_save, cpu_state, initialize, load_stage, model_for,
     pack, restore_rng, rng_state, set_training, strict_load, trainable_key)
 
@@ -38,28 +39,76 @@ def pretrained_parent_models(cfg):
     return lambda parent,parent_cfg: model_for(parsed(parent_cfg))
 
 
-def to_device(value,device):
+def to_device(value,device,non_blocking=False):
     if isinstance(value,torch.Tensor):
-        return value.to(device)
+        return value.to(device,non_blocking=non_blocking)
     if isinstance(value,dict):
-        return {k:to_device(v,device) for k,v in value.items()}
+        return {k:to_device(v,device,non_blocking) for k,v in value.items()}
     if isinstance(value,list):
-        return [to_device(v,device) for v in value]
+        return [to_device(v,device,non_blocking) for v in value]
     if isinstance(value,tuple):
-        return tuple(to_device(v,device) for v in value)
+        return tuple(to_device(v,device,non_blocking) for v in value)
     return value
 
 
-def loader(dataset,cfg,train,generator):
+def _env_int(name, default, minimum):
+    value=os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed_value=int(value)
+    except (TypeError,ValueError):
+        raise ValueError('%s must be an integer' % name)
+    if parsed_value<minimum:
+        raise ValueError('%s must be >= %d' % (name,minimum))
+    return parsed_value
+
+
+def _env_bool(name, default):
+    value=os.environ.get(name)
+    if value is None:
+        return default
+    if value not in ('0','1'):
+        raise ValueError('%s must be 0 or 1' % name)
+    return value=='1'
+
+
+def dataloader_settings(cfg):
+    """Resolve optional runtime overrides while preserving legacy defaults."""
+    train_workers_default=cfg['train_params'].get('num_workers',0)
+    if type(train_workers_default) is not int or train_workers_default<0:
+        raise ValueError('train_params.num_workers must be a non-negative integer')
+    train_workers=_env_int('NEGO_TRAIN_NUM_WORKERS',train_workers_default,0)
+    val_workers=_env_int('NEGO_VAL_NUM_WORKERS',0,0)
+    prefetch_default=None
+    prefetch_env=os.environ.get('NEGO_PREFETCH_FACTOR')
+    prefetch=(_env_int('NEGO_PREFETCH_FACTOR',2,1) if prefetch_env is not None else prefetch_default)
+    pin_memory=_env_bool('NEGO_PIN_MEMORY',False)
+    persistent=_env_bool('NEGO_PERSISTENT_WORKERS',False)
+    non_blocking=_env_bool('NEGO_NON_BLOCKING_TRANSFER',False)
+    if non_blocking and not pin_memory:
+        raise ValueError('NEGO_NON_BLOCKING_TRANSFER=1 requires NEGO_PIN_MEMORY=1')
+    return {'train_num_workers':train_workers,'val_num_workers':val_workers,
+            'prefetch_factor':prefetch,'pin_memory':pin_memory,
+            'persistent_workers':persistent,'non_blocking_transfer':non_blocking}
+
+
+def loader(dataset,cfg,train,generator,settings=None):
     collate = dataset.collate_batch_train if train else dataset.collate_batch_test
     if train and cfg.get('nego', {}).get('multi_batch', {}).get('enabled', False):
         from opencood.data_utils.datasets.nego_m1_batch import collate_pretrain_vectorized
         collate = partial(collate_pretrain_vectorized, dataset.collate_batch_train,
                           cfg['nego_protocol']['stage'].split('/')[1])
-    return DataLoader(dataset,batch_size=cfg['train_params']['batch_size'] if train else 1,
-          shuffle=train,drop_last=False,num_workers=cfg['train_params'].get('num_workers',0) if train else 0,
-          collate_fn=collate,
-          worker_init_fn=seed_worker,generator=generator,persistent_workers=False,pin_memory=False)
+    settings=settings or dataloader_settings(cfg)
+    workers=settings['train_num_workers'] if train else settings['val_num_workers']
+    kwargs={'batch_size':cfg['train_params']['batch_size'] if train else 1,
+          'shuffle':train,'drop_last':False,'num_workers':workers,
+          'collate_fn':collate,'worker_init_fn':seed_worker,'generator':generator,
+          'persistent_workers':settings['persistent_workers'] if workers>0 else False,
+          'pin_memory':settings['pin_memory']}
+    if workers>0 and settings['prefetch_factor'] is not None:
+        kwargs['prefetch_factor']=settings['prefetch_factor']
+    return DataLoader(dataset,**kwargs)
 
 
 def check_process():
@@ -141,8 +190,9 @@ def require_vectorized_supervision(batch, cfg):
     raise ValueError('Vectorized batch has no enabled supervision')
 
 
-def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,checkpoint_sha=None):
+def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,checkpoint_sha=None,settings=None):
     from opencood.utils import eval_utils
+    settings=settings or dataloader_settings(cfg)
     model.eval()
     stats=stats_template()
     ledger=[]
@@ -152,7 +202,7 @@ def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,c
         encoder=getattr(model,'encoder_'+member,None)
         if encoder is not None:
             hooks.append(encoder.register_forward_pre_hook(lambda mod,args,m=member:actual_calls.append(m)))
-    for index,batch in enumerate(loader(dataset,cfg,False,generator)):
+    for index,batch in enumerate(loader(dataset,cfg,False,generator,settings)):
         if batch is None:
             raise ValueError('Dropped evaluation frame: '+str(index))
         members=list(batch['ego']['agent_modality_list'])
@@ -160,7 +210,7 @@ def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,c
             assert_prefix(members,requested)
             if len(members)>requested or members[0]!='m1':
                 raise ValueError('Illegal actual forward members')
-        batch=to_device(batch,device)
+        batch=to_device(batch,device,settings['non_blocking_transfer'])
         actual_calls.clear()
         with torch.no_grad():
             output=model(batch['ego'])
@@ -206,9 +256,12 @@ def train(experiment,stage,resume=False):
     validate_runtime_batch(cfg)
     if cfg['nego_protocol']['stage']!=stage or stage=='final_infer':
         raise ValueError('Wrong stage YAML')
+    if cfg.get('seed')!=303:
+        raise ValueError('V2XSET DOMA R2 training requires YAML seed=303')
     verify_lock(cfg['nego_protocol']['dataset'])
     device=require_cuda()
     stage_dir=Path(experiment)/stage
+    loader_config=dataloader_settings(cfg)
     vectorized = cfg.get('nego', {}).get('multi_batch', {}).get('enabled', False)
     log_freq = cfg.get('nego', {}).get('multi_batch', {}).get('log_every', 10)
     if vectorized and (isinstance(log_freq, bool) or not isinstance(log_freq, int) or log_freq < 1):
@@ -225,8 +278,12 @@ def train(experiment,stage,resume=False):
             for handler in (logging.FileHandler(stage_dir/'train.log', encoding='utf-8'), logging.StreamHandler()):
                 handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
                 log.addHandler(handler)
-    seed_all(cfg['seed'])
-    generator=torch.Generator().manual_seed(cfg['seed'])
+    seed_everything(cfg['seed'])
+    generator=torch.Generator()
+    generator.manual_seed(cfg['seed'])
+    logging.info('stage=%s seed=%d dataloader=%s',stage,cfg['seed'],loader_config)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
     runtime=parsed(cfg)
     model=model_for(runtime).to(device)
     if resume:
@@ -249,7 +306,7 @@ def train(experiment,stage,resume=False):
     optimizer=getattr(torch.optim,opt_cfg['core_method'])([p for p in model.parameters() if p.requires_grad],
                           lr=opt_cfg['lr'],**opt_cfg.get('args',{}))
     from opencood.tools.train_utils import setup_lr_schedular
-    scheduler=setup_lr_schedular(cfg,optimizer,len(loader(train_data,cfg,True,generator)))
+    scheduler=setup_lr_schedular(cfg,optimizer,len(loader(train_data,cfg,True,generator,loader_config)))
     start=0
     global_step=0
     best=float('inf') if cfg['nego_protocol']['phase']=='pretrain' else float('-inf')
@@ -263,18 +320,19 @@ def train(experiment,stage,resume=False):
         global_step=state['global_step']
     frozen={k:v for k,v in cpu_state(model).items() if not trainable_key(k,cfg)}
     writer=SummaryWriter(str(stage_dir/'tensorboard'))
-    write_json(stage_dir/'provenance.json',{'parents':provenance,'config_sha256':digest(cfg),
-          'protocol_sha256':file_sha(ROOT/cfg['nego_protocol']['protocol_lock']),
-          'code_sha256':__import__('opencood.tools.nego_state',fromlist=['code_hash']).code_hash(),
-          'torch':torch.__version__,'cuda':torch.version.cuda,'DDP':False,'seed':cfg['seed']})
+    config_sha=digest(cfg)
+    protocol_sha=file_sha(ROOT/cfg['nego_protocol']['protocol_lock'])
+    code_sha=__import__('opencood.tools.nego_state',fromlist=['code_hash']).code_hash()
+    write_json(stage_dir/'provenance.json',{'parents':provenance,'config_sha256':config_sha,
+          'protocol_sha256':protocol_sha,'code_sha256':code_sha,
+          'config_sha':config_sha,'protocol_sha':protocol_sha,'code_sha':code_sha,
+          'torch':torch.__version__,'cuda':torch.version.cuda,'DDP':False,'seed':cfg['seed'],
+          **loader_config})
     for epoch in range(start,cfg['train_params']['epoches']):
-        # Rebuild the random CAV/ego assignment identically on fresh run or resume.
-        seed_all(cfg['seed']+epoch)
-        generator.manual_seed(cfg['seed']+epoch)
         train_data.reinitialize()
         set_training(model,cfg)
         losses=[]
-        train_loader=loader(train_data,cfg,True,generator)
+        train_loader=loader(train_data,cfg,True,generator,loader_config)
         batch_start=time.perf_counter() if vectorized else None
         for index,batch in enumerate(train_loader):
             if batch is None:
@@ -283,7 +341,7 @@ def train(experiment,stage,resume=False):
                 continue  # Same empty-positive training skip as native trainer.
             if vectorized:
                 require_vectorized_supervision(batch,cfg)
-            batch=to_device(batch,device)
+            batch=to_device(batch,device,loader_config['non_blocking_transfer'])
             optimizer.zero_grad(set_to_none=True)
             loss=loss_for(model,criterion,batch,cfg,epoch)
             if not torch.isfinite(loss):
@@ -315,19 +373,19 @@ def train(experiment,stage,resume=False):
             raise ValueError('Frozen parameter/buffer changed')
         if (epoch+1)%cfg['train_params']['eval_freq']==0 or epoch+1==cfg['train_params']['epoches']:
             saved_rng=rng_state(generator)
-            seed_all(cfg['seed'])
             if cfg['nego_protocol']['phase']=='pretrain':
                 model.eval()
                 values=[]
                 with torch.no_grad():
-                    for batch in loader(val_data,cfg,False,generator):
-                        values.append(float(loss_for(model,criterion,to_device(batch,device),cfg,epoch)))
+                    for batch in loader(val_data,cfg,False,generator,loader_config):
+                        values.append(float(loss_for(model,criterion,to_device(batch,device,loader_config['non_blocking_transfer']),cfg,epoch)))
                 metric=float(np.mean(values))
                 improved=metric<best
             else:
                 validation=model_for(parsed(val_cfg),inference=True).to(device)
                 strict_load(validation,{k:current[k] for k in validation.state_dict()})
-                report=evaluate(validation,val_data,val_cfg,device,generator,stage_dir/f'validation/epoch_{epoch+1}')
+                report=evaluate(validation,val_data,val_cfg,device,generator,
+                                stage_dir/f'validation/epoch_{epoch+1}',settings=loader_config)
                 metric=report['AP']['AP@0.5']
                 improved=metric>best
                 del validation
@@ -442,7 +500,7 @@ def infer(experiment,use_cav):
             hooks.append(encoder.register_forward_pre_hook(lambda mod,args,m=member:calls.append(m)))
     # Dataset/forward checks, plus encoder calls are retained as audit evidence.
     report=evaluate(model,dataset,runtime,device,torch.Generator().manual_seed(cfg['seed']),out,use_cav,
-                    file_sha(Path(experiment)/'final_infer/assembled.pth'))
+                    file_sha(Path(experiment)/'final_infer/assembled.pth'),settings=dataloader_settings(cfg))
     for hook in hooks:
         hook.remove()
     used=set(calls)

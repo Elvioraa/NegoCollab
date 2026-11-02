@@ -164,11 +164,22 @@ def seed_all(seed):
     torch.backends.cudnn.deterministic = True
 
 
+def seed_everything(seed):
+    """Match DOMA's training seeding without changing cuDNN policy."""
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def seed_worker(worker_id):
     import torch
-    value = torch.initial_seed() % (2**32)
-    random.seed(value)
-    np.random.seed(value)
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 class ProtocolAdaptor:

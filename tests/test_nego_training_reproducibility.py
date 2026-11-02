@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from opencood.tools.nego_protocol import config_root, read_yaml, seed_all, seed_worker, validate_config
+from opencood.tools.nego_protocol import (config_root, read_yaml, seed_all, seed_everything,
+                                          seed_worker, validate_config)
 from opencood.tools.nego_state import rng_state, restore_rng
 from opencood.tools.run_nego_doma import require_vectorized_supervision
 
@@ -33,6 +34,30 @@ def test_worker_seed_uses_torch_initial_seed(monkeypatch):
     expected = (random.random(), np.random.random())
     seed_worker(7)
     assert (random.random(), np.random.random()) == expected
+
+
+def test_domA_training_seed_sequence_does_not_change_cudnn_policy(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    old_benchmark = torch.backends.cudnn.benchmark
+    old_deterministic = torch.backends.cudnn.deterministic
+    seed_everything(303)
+    expected = (random.random(), float(np.random.random()), torch.rand(3))
+    seed_everything(303)
+    actual = (random.random(), float(np.random.random()), torch.rand(3))
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2])
+    assert torch.backends.cudnn.benchmark == old_benchmark
+    assert torch.backends.cudnn.deterministic == old_deterministic
+
+
+def test_worker_seeds_python_numpy_and_torch(monkeypatch):
+    monkeypatch.setattr(torch, 'initial_seed', lambda: 123456789012)
+    seed_worker(0)
+    expected = (random.random(), np.random.random(), torch.rand(3))
+    seed_worker(7)
+    actual = (random.random(), np.random.random(), torch.rand(3))
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2])
 
 
 def test_sampler_order_and_epoch_rebuild_are_reproducible():
