@@ -85,7 +85,7 @@ def getIntermediateheterpairFusionDataset(cls):
             mapping_dict = params['heter']['mapping_dict']
             cav_preference = params['heter'].get("cav_preference", None)
 
-            self.adaptor = Adaptor(self.ego_modality,
+            self.adaptor = getattr(self, "make_protocol_adaptor", Adaptor)(self.ego_modality,
                                    self.modality_name_list,
                                    self.modality_assignment,
                                    lidar_channels_dict,

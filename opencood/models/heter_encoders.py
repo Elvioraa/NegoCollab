@@ -44,6 +44,10 @@ class PointPillar(nn.Module):
                       'voxel_coords': voxel_coords,
                       'voxel_num_points': voxel_num_points}
 
+        if data_dict.get('nego_m1_vectorized', False):
+            batch_dict['nego_expected_cavs'] = int(data_dict['record_len'].sum().item())
+            batch_dict['nego_vectorized_pretrain'] = True
+
         batch_dict = self.pillar_vfe(batch_dict)
         batch_dict = self.scatter(batch_dict)
         lidar_feature_2d = batch_dict['spatial_features'] # H0, W0
@@ -67,7 +71,14 @@ class SECOND(nn.Module):
         voxel_features = data_dict[f'inputs_{modality_name}']['voxel_features']
         voxel_coords = data_dict[f'inputs_{modality_name}']['voxel_coords']
         voxel_num_points = data_dict[f'inputs_{modality_name}']['voxel_num_points']
-        batch_size = voxel_coords[:,0].max() + 1
+        if data_dict.get('nego_vectorized_pretrain', False):
+            batch_size = int(data_dict['record_len'].sum().item())
+            if voxel_coords.numel() == 0:
+                raise ValueError('SECOND vectorized batch has no voxels')
+            if voxel_coords[:, 0].min() < 0 or voxel_coords[:, 0].max() >= batch_size:
+                raise ValueError('SECOND voxel CAV index out of bounds')
+        else:
+            batch_size = voxel_coords[:,0].max() + 1
 
 
         batch_dict = {'voxel_features': voxel_features,

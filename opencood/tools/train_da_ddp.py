@@ -15,7 +15,6 @@ from opencood.data_utils.datasets import build_dataset
 from opencood.tools import multi_gpu_utils
 from icecream import ic
 import tqdm
-os.environ["WANDB_API_KEY"] = 'b058297d8947bc34e6e11764cffa6a3a94671dc6'
 os.environ["WANDB_MODE"] = "offline"
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --use_env opencood/tools/train_ddp.py --hypes_yaml ${CONFIG_FILE} [--model_dir  ${CHECKPOINT_FOLDER}

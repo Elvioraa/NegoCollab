@@ -1,0 +1,95 @@
+dataset: opv2v
+stages:
+  pretrain/m1:
+    config: pretrain/m1/config.yaml
+    parents: []
+    checkpoint: best.pth
+    core_method: homo_collab
+    phase: pretrain
+    budget_source: opencood/hypes_yaml/opv2v/Homo/m1_pointpillar_pyramid.yaml
+  pretrain/m2:
+    config: pretrain/m2/config.yaml
+    parents: []
+    checkpoint: best.pth
+    core_method: homo_collab
+    phase: pretrain
+    budget_source: opencood/hypes_yaml/opv2v/Homo/m1_pointpillar_pyramid.yaml
+  pretrain/m3:
+    config: pretrain/m3/config.yaml
+    parents: []
+    checkpoint: best.pth
+    core_method: homo_collab
+    phase: pretrain
+    budget_source: opencood/hypes_yaml/opv2v/Homo/m1_pointpillar_pyramid.yaml
+  pretrain/m4:
+    config: pretrain/m4/config.yaml
+    parents: []
+    checkpoint: best.pth
+    core_method: homo_collab
+    phase: pretrain
+    budget_source: opencood/hypes_yaml/opv2v/Homo/m1_pointpillar_pyramid.yaml
+  alliance/nego:
+    config: alliance/nego/config.yaml
+    parents:
+    - pretrain/m1
+    - pretrain/m2
+    checkpoint: best.pth
+    core_method: heter_nego_train
+    phase: nego
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage1/m1m2_pyramid.yaml#train_setting.nego
+  alliance/ft:
+    config: alliance/ft/config.yaml
+    parents:
+    - alliance/nego
+    checkpoint: best.pth
+    core_method: heter_nego_inf
+    phase: ft
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage1/m1m2_pyramid.yaml#train_setting.ft
+  m3/align:
+    config: m3/align/config.yaml
+    parents:
+    - alliance/nego
+    - alliance/ft
+    - pretrain/m3
+    checkpoint: best.pth
+    core_method: heter_nego_train_align
+    phase: align
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage2/m1m2_guide_m3_pyramid.yaml#train_setting.align
+  m3/ft:
+    config: m3/ft/config.yaml
+    parents:
+    - m3/align
+    checkpoint: best.pth
+    core_method: heter_nego_inf
+    phase: ft
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage2/m1m2_guide_m3_pyramid.yaml#train_setting.ft
+  m4/align:
+    config: m4/align/config.yaml
+    parents:
+    - alliance/nego
+    - alliance/ft
+    - pretrain/m4
+    checkpoint: best.pth
+    core_method: heter_nego_train_align
+    phase: align
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage2/m1m2_guide_m4_pyramid.yaml#train_setting.align
+  m4/ft:
+    config: m4/ft/config.yaml
+    parents:
+    - m4/align
+    checkpoint: best.pth
+    core_method: heter_nego_inf
+    phase: ft
+    budget_source: opencood/hypes_yaml/opv2v/NGCB/stage2/m1m2_guide_m4_pyramid.yaml#train_setting.ft
+  final_infer:
+    config: final_infer/config.yaml
+    parents:
+    - alliance/ft
+    - m3/ft
+    - m4/ft
+    checkpoint: assembled.pth
+    core_method: heter_nego_inf
+    phase: inf
+    budget_source: not a training stage
+parallelism: pretrain independent; m3/m4 branches independent after frozen initial
+  alliance; final waits for both

@@ -42,7 +42,12 @@ class PointPillarScatter(nn.Module):
         pillar_features, coords = batch_dict['pillar_features'], batch_dict[
             'voxel_coords']
         batch_spatial_features = []
-        batch_size = coords[:, 0].max().int().item() + 1
+        if 'nego_expected_cavs' in batch_dict:
+            batch_size = batch_dict['nego_expected_cavs']
+            if batch_size < 1 or (coords.numel() and (coords[:, 0].min() < 0 or coords[:, 0].max() >= batch_size)):
+                raise ValueError('Invalid vectorized CAV voxel index')
+        else:
+            batch_size = coords[:, 0].max().int().item() + 1
 
         for batch_idx in range(batch_size):
             spatial_feature = torch.zeros(

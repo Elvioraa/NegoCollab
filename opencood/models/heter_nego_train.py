@@ -39,7 +39,7 @@ class HeterNegoTrain(nn.Module):
     def __init__(self, args):
         super(HeterNegoTrain, self).__init__()
        
-        self.modality_name_list = list(set(args['modality_setting'].keys()))
+        self.modality_name_list = (sorted(args['modality_setting']) if args.get('doma_protocol', False) else list(set(args['modality_setting'].keys())))
 
         self.cav_range = args['lidar_range']
         self.sensor_type_dict = OrderedDict()
@@ -202,7 +202,7 @@ class HeterNegoTrain(nn.Module):
         for name, module in self.named_modules():
             module.eval()
 
-        self.newtype_modality_list = list(set(self.modality_name_list) - set(self.allied_modality_list))
+        self.newtype_modality_list = (sorted(set(self.modality_name_list) - set(self.allied_modality_list)) if args.get('doma_protocol', False) else list(set(self.modality_name_list) - set(self.allied_modality_list)))
 
         """ nego阶段, 仅更新未加入联盟的comm模块的参数 """
         if self.stage == 'nego':

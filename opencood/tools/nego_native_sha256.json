@@ -1,0 +1,91 @@
+{
+  "baseline_commit": "8cd12e68549ab23109a691230990004a38402fef",
+  "files": {
+    "opencood/loss/nego_loss.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "b9696135e6129b920a7542a268a22f5560cbfb78f76a48c8b4429b9a5bed1dd7"
+    },
+    "opencood/loss/nego_loss_align.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "72a695dea9c9910f0df68d2d2738a480d1337b535f41f1377274f531d1102e11"
+    },
+    "opencood/loss/nego_loss_ft.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "0ebe67a0f363c89935ce1ad698c4bccb0c9f926ee17988a67aba0ced9016577d"
+    },
+    "opencood/models/comm_modules/comm_in_pub.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "aa75f9e1046f071c5ae76b42ca685724c06161ea337a2e441f66026f07a64c68"
+    },
+    "opencood/models/sub_modules/keyfeat_modules.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "05f12f47f30c7a7761746b75c464d1cfa93076995e34d09adc75ed5fcbb34de8"
+    },
+    "opencood/tools/find_best_ap50_and_save_bak.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "9866169b2c2c653806ad72cfa0ea43183da7fb66cbbb1eb12df1a47e8aef78a9"
+    },
+    "opencood/tools/inference_nego.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "690695c787717865ec50d3567cf3cc5ba72307434438e1c10fb57880c19dff81"
+    },
+    "opencood/tools/train.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "bfc7a122a2b31bbf73a88d6219ec5de0a6511a05b5e0ee4b23a909a0c4a881eb"
+    },
+    "opencood/tools/train_da.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "714db4f83f56df4a63c769d37d101fcea4191cb94c7a83e707fc713c4d89a295"
+    },
+    "opencood/tools/train_da_ddp.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "e58c8eabfc9ce4ac371b2b12777e3bd18063d1b07b18a701b1a56fc584ab59cd"
+    },
+    "opencood/tools/train_lsd.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "29662c2871b581c72ff4327e5697ad0afed5a01fdd35fe0eab0248553c27dbbd"
+    },
+    "opencood/tools/train_lsd_ddp.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "0a06e423265b3914c3b289d45327a2cfba5b35582b9867214794e2443c3050f8"
+    },
+    "opencood/tools/train_nego.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "4a1586de0735781053cd3833d2195f2c04b8a93c75ce61c64cb9fa3ae662263e"
+    },
+    "opencood/tools/train_nego_onlytrain.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "86ea0e2f61670fd1a78a32ef416082d65aa971b76836e533f8ac229cf8b03c39"
+    },
+    "opencood/tools/train_nego_val_inf.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "5d0c4dcd64b1248f4a1aa0bf3788d403d9d20bbf5c358ed3a7f21278f844c1e5"
+    },
+    "opencood/tools/train_nego_vanilla.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "3d7bd96613f230718188ebcd57886f37540246f8dfe4c38f5391ffa0b5bad6ea"
+    },
+    "opencood/tools/train_nego_vanilla_onlytrain_ddp.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "f393f65be06e96615a9e00e0bcafad35608d146ed223e426ba3281a93a24312e"
+    },
+    "opencood/tools/train_stamp_onlytrain.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "4d858f9876750c0898152f2e9241124639d5321797be09866b019d5f8fc88344"
+    },
+    "opencood/tools/train_stamp_val_inf.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "62cb8c18cc709654763dfa0d68d52e7d657cadcf57f2216a5d785ba071a6c8e7"
+    },
+    "opencood/tools/train_utils.py": {
+      "normalize_wandb_assignment": false,
+      "sha256": "73de4ebb69ec46e9725340a0b887db9ac4136b9b73023108690cade44f4efc6d"
+    },
+    "opencood/tools/val_distance.py": {
+      "normalize_wandb_assignment": true,
+      "sha256": "8fe1f281f5f075dc15ab517fcf9c82e9b697cd7ce42edce3c19312a9228565dd"
+    }
+  },
+  "normalization": "LF; remove at most one top-level single-line literal W&B API key assignment in designated files",
+  "schema_version": 1
+}

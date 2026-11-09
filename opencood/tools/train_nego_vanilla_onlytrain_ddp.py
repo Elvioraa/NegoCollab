@@ -26,7 +26,6 @@ from opencood.tools import multi_gpu_utils, train_utils
 from opencood.data_utils.datasets import build_dataset
 
 import wandb
-os.environ["WANDB_API_KEY"] = 'b058297d8947bc34e6e11764cffa6a3a94671dc6'
 os.environ["WANDB_MODE"] = "offline"
 
 

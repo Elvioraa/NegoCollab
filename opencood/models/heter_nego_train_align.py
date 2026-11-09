@@ -39,7 +39,7 @@ class HeterNegoTrainAlign(nn.Module):
     def __init__(self, args):
         super(HeterNegoTrainAlign, self).__init__()
        
-        self.modality_name_list = list(set(args['modality_setting'].keys()))
+        self.modality_name_list = (sorted(args['modality_setting']) if args.get('doma_protocol', False) else list(set(args['modality_setting'].keys())))
 
         self.cav_range = args['lidar_range']
         self.sensor_type_dict = OrderedDict()
@@ -208,7 +208,7 @@ class HeterNegoTrainAlign(nn.Module):
         else:
             AssertionError('Only align and ft stage')
                 
-        self.newtype_modality_list = list(set(self.modality_name_list) - set(self.allied_modality_list))
+        self.newtype_modality_list = (sorted(set(self.modality_name_list) - set(self.allied_modality_list)) if args.get('doma_protocol', False) else list(set(self.modality_name_list) - set(self.allied_modality_list)))
                         
         # check again which module is not fixed.
         check_trainable_module(self)

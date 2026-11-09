@@ -149,7 +149,10 @@ class PillarVFE(nn.Module):
         features *= mask
         for pfn in self.pfn_layers:
             features = pfn(features)
-        features = features.squeeze()
+        if batch_dict.get('nego_vectorized_pretrain', False):
+            features = features.squeeze(1)
+        else:
+            features = features.squeeze()
         batch_dict['pillar_features'] = features
 
         return batch_dict

@@ -16,7 +16,6 @@ import tqdm
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --use_env opencood/tools/train_ddp.py --hypes_yaml ${CONFIG_FILE} [--model_dir  ${CHECKPOINT_FOLDER}
 import wandb
-os.environ["WANDB_API_KEY"] = 'b058297d8947bc34e6e11764cffa6a3a94671dc6'
 os.environ["WANDB_MODE"] = "offline"
 def train_parser():
     parser = argparse.ArgumentParser(description="synthetic data generation")

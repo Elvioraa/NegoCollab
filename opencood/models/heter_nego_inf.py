@@ -28,7 +28,7 @@ import torchvision
 class HeterNegoInf(HeterNegoTrain):
     def __init__(self, args):  
         
-        self.modality_name_list = list(set(args['mapping_dict'].values()))
+        self.modality_name_list = (sorted(set(args['mapping_dict'].values())) if args.get('doma_protocol', False) else list(set(args['mapping_dict'].values())))
             
         for modality_name in self.modality_name_list:
             model_setting = args[modality_name]

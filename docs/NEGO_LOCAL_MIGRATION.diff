@@ -1,0 +1,1778 @@
+--- review/scripts/nego_runtime_batch/sitecustomize.py
++++ NegoCollab/scripts/nego_runtime_batch/sitecustomize.py
+@@ -1,7 +1,7 @@
+ """Opt-in DataLoader batch override loaded before the stage runner imports Torch.
+ 
+-The runner passes its YAML batch size to DataLoader. Keep that constructor value
+-as the upper bound; only explicit ``shuffle=True`` loaders may be reduced.
++The runner passes its YAML batch size to DataLoader. Only explicit
++``shuffle=True`` loaders may be overridden; YAML is the default, not a limit.
+ Without NEGO_RUNTIME_BATCH_SIZE, do not import Torch or patch any class.
+ """
+ import os
+@@ -33,9 +33,6 @@
+         if training:
+             if type(original_batch_size) is not int or original_batch_size < 1:
+                 raise ValueError('Runtime batch override requires a positive original YAML batch_size')
+-            if runtime_batch_size > original_batch_size:
+-                raise ValueError('NEGO_RUNTIME_BATCH_SIZE={} exceeds original YAML batch_size={}'.format(
+-                    runtime_batch_size, original_batch_size))
+             bound.arguments['batch_size'] = runtime_batch_size
+         # Preserve Torch's own sampler, batch_sampler and argument validation.
+         original_init(*bound.args, **bound.kwargs)
+--- review/tests/test_nego_runtime_batch_hook.py
++++ NegoCollab/tests/test_nego_runtime_batch_hook.py
+@@ -1,136 +1,137 @@
+-"""Interpreter-startup tests with synthetic samples and the unchanged runner loader."""
+-import json
+-import os
+-import subprocess
+-import sys
+-from pathlib import Path
+-
+-import pytest
+-
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-HOOK = ROOT / 'scripts' / 'nego_runtime_batch'
+-CODE = r'''
+-import json, sys, torch
+-from torch.utils.data import DataLoader
+-from torch.utils.data.dataloader import DataLoader as InternalDataLoader
+-from opencood.tools.run_nego_doma import loader, DataLoader as RunnerDataLoader
+-
+-class Samples:
+-    def __len__(self): return 5
+-    def __getitem__(self, index): return index
+-    def collate_batch_train(self, items): return torch.tensor(items)
+-    def collate_batch_test(self, items): return torch.tensor(items)
+-
+-# These constructor settings represent a YAML batch size of 4 without editing
+-# or importing the real Dataset/YAML processing chain.
+-cfg = {'train_params': {'batch_size': 4, 'num_workers': 0}}
+-generator = torch.Generator().manual_seed(303)
+-train = loader(Samples(), cfg, True, generator)
+-val = loader(Samples(), cfg, False, generator)
+-positional = DataLoader(list(range(5)), 4, True, num_workers=0)
+-print(json.dumps({'train': train.batch_size, 'val': val.batch_size,
+-    'train_batches': [len(batch) for batch in train],
+-    'val_batches': [len(batch) for batch in val],
+-    'positional': positional.batch_size,
+-    'same_class': RunnerDataLoader is DataLoader is InternalDataLoader,
+-    'hooked': getattr(RunnerDataLoader.__init__, '__nego_runtime_batch_hook__', False),
+-    'sitecustomize': sys.modules['sitecustomize'].__file__}))
+-'''
+-
+-
+-def child(value, code=CODE, overrides=None):
+-    env = os.environ.copy()
+-    env.pop('NEGO_RUNTIME_BATCH_SIZE', None)
+-    for name in ('NEGO_TRAIN_NUM_WORKERS', 'NEGO_VAL_NUM_WORKERS',
+-                 'NEGO_PREFETCH_FACTOR', 'NEGO_PIN_MEMORY',
+-                 'NEGO_PERSISTENT_WORKERS', 'NEGO_NON_BLOCKING_TRANSFER'):
+-        env.pop(name, None)
+-    if value is not None:
+-        env['NEGO_RUNTIME_BATCH_SIZE'] = value
+-    env['PYTHONPATH'] = os.pathsep.join([str(HOOK), str(ROOT), env.get('PYTHONPATH', '')])
+-    env['PYTHONDONTWRITEBYTECODE'] = '1'
+-    env.update(overrides or {})
+-    return subprocess.run([sys.executable, '-c', code], cwd=str(ROOT), env=env,
+-                          capture_output=True, text=True, timeout=90)
+-
+-
+-@pytest.mark.parametrize('value,actual,sizes', [
+-    (None, 4, [4, 1]), ('2', 2, [2, 2, 1]), ('1', 1, [1, 1, 1, 1, 1])])
+-def test_startup_hook_and_real_runner_loader(value, actual, sizes):
+-    result = child(value)
+-    assert result.returncode == 0, result.stdout + result.stderr
+-    report = json.loads(result.stdout.strip().splitlines()[-1])
+-    assert Path(report['sitecustomize']).resolve() == (HOOK / 'sitecustomize.py').resolve()
+-    assert report['train'] == report['positional'] == actual
+-    assert report['train_batches'] == sizes
+-    assert report['val'] == 1 and report['val_batches'] == [1] * 5
+-    assert report['same_class'] and report['hooked'] == (value is not None)
+-    if value is None:
+-        assert '[nego_runtime_batch]' not in result.stderr
+-    else:
+-        assert 'actual_batch_size={} original_yaml_batch_size=4'.format(actual) in result.stderr
+-
+-
+-@pytest.mark.parametrize('value', ['', '0', '-1', 'abc', '2.5', ' 2', 'True'])
+-def test_invalid_environment_is_fatal_before_user_code(value):
+-    result = child(value, "print('BODY_EXECUTED')")
+-    assert result.returncode != 0
+-    assert 'NEGO_RUNTIME_BATCH_SIZE must be a positive integer' in result.stderr
+-    assert 'BODY_EXECUTED' not in result.stdout
+-
+-
+-def test_runtime_batch_cannot_exceed_original_configuration():
+-    result = child('8')
+-    assert result.returncode != 0
+-    assert 'exceeds original YAML batch_size=4' in result.stderr
+-
+-
+-def test_hook_preserves_torch_sampler_validation():
+-    result = child('2', '''
+-from torch.utils.data import DataLoader, SequentialSampler
+-DataLoader(list(range(5)), batch_size=4, shuffle=True, sampler=SequentialSampler(range(5)))
+-''')
+-    assert result.returncode != 0
+-    assert 'sampler option is mutually exclusive with shuffle' in result.stderr
+-
+-
+-@pytest.mark.parametrize('runtime_env', [
+-    'NEGO_TRAIN_NUM_WORKERS=8\nNEGO_VAL_NUM_WORKERS=2\n',
+-    'NEGO_VAL_NUM_WORKERS=2\n'])
+-def test_orchestrator_validation_workers_and_batch_size(tmp_path, runtime_env):
+-    script = (ROOT / 'scripts/run_nego_v2xset_doma_r2.sh').read_text(encoding='utf-8')
+-    # Run only runtime.env loading and exports, stopping before any preflight,
+-    # experiment logging, locking, or training commands.
+-    prefix = script.split('set -a\n', 1)[1].split(': "${NEGO_EXPECTED_GIT_SHA', 1)[0]
+-    (tmp_path / 'runtime.env').write_text(runtime_env, encoding='utf-8')
+-    env = os.environ.copy()
+-    env['EXP'] = tmp_path.as_posix()
+-    env.pop('NEGO_TRAIN_NUM_WORKERS', None)
+-    env.pop('NEGO_VAL_NUM_WORKERS', None)
+-    bash = env.get('NEGO_TEST_BASH', 'bash')
+-    result = subprocess.run([bash, '-c', 'set -eu\nset -a\n' + prefix +
+-                             '\nprintf "%s,%s" "${NEGO_TRAIN_NUM_WORKERS:-}" "$NEGO_VAL_NUM_WORKERS"'],
+-                            env=env, capture_output=True, text=True, check=True)
+-    train_workers, val_workers = result.stdout.strip().split(',')
+-    assert val_workers == '8'
+-    overrides = {'NEGO_VAL_NUM_WORKERS': val_workers}
+-    if train_workers:
+-        overrides['NEGO_TRAIN_NUM_WORKERS'] = train_workers
+-    result = child('2', r'''
+-import json, torch
+-from opencood.tools.run_nego_doma import loader
+-class Samples(list):
+-    collate_batch_train = staticmethod(list)
+-    collate_batch_test = staticmethod(list)
+-# Represent the experiment's unchanged training workers=8 in memory.
+-cfg = {'train_params': {'batch_size': 4, 'num_workers': 8}}
+-g = torch.Generator().manual_seed(303)
+-train = loader(Samples(range(5)), cfg, True, g)
+-val = loader(Samples(range(5)), cfg, False, g)
+-print(json.dumps({'train_workers': train.num_workers, 'val_workers': val.num_workers,
+-                  'train_batch': train.batch_size, 'val_batch': val.batch_size}))
+-''', overrides=overrides)
+-    assert result.returncode == 0, result.stdout + result.stderr
+-    report = json.loads(result.stdout.strip().splitlines()[-1])
+-    assert report == {'train_workers': 8, 'val_workers': 8, 'train_batch': 2, 'val_batch': 1}
++"""Interpreter-startup tests with synthetic samples and the unchanged runner loader."""
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++HOOK = ROOT / 'scripts' / 'nego_runtime_batch'
++CODE = r'''
++import json, sys, torch
++from torch.utils.data import DataLoader
++from torch.utils.data.dataloader import DataLoader as InternalDataLoader
++from opencood.tools.run_nego_doma import loader, DataLoader as RunnerDataLoader
++
++class Samples:
++    def __len__(self): return 5
++    def __getitem__(self, index): return index
++    def collate_batch_train(self, items): return torch.tensor(items)
++    def collate_batch_test(self, items): return torch.tensor(items)
++
++# These constructor settings represent a YAML batch size of 4 without editing
++# or importing the real Dataset/YAML processing chain.
++cfg = {'train_params': {'batch_size': 4, 'num_workers': 0}}
++generator = torch.Generator().manual_seed(303)
++train = loader(Samples(), cfg, True, generator)
++val = loader(Samples(), cfg, False, generator)
++positional = DataLoader(list(range(5)), 4, True, num_workers=0)
++print(json.dumps({'train': train.batch_size, 'val': val.batch_size,
++    'train_batches': [len(batch) for batch in train],
++    'val_batches': [len(batch) for batch in val],
++    'positional': positional.batch_size,
++    'same_class': RunnerDataLoader is DataLoader is InternalDataLoader,
++    'hooked': getattr(RunnerDataLoader.__init__, '__nego_runtime_batch_hook__', False),
++    'sitecustomize': sys.modules['sitecustomize'].__file__}))
++'''
++
++
++def child(value, code=CODE, overrides=None):
++    env = os.environ.copy()
++    env.pop('NEGO_RUNTIME_BATCH_SIZE', None)
++    for name in ('NEGO_TRAIN_NUM_WORKERS', 'NEGO_VAL_NUM_WORKERS',
++                 'NEGO_PREFETCH_FACTOR', 'NEGO_PIN_MEMORY',
++                 'NEGO_PERSISTENT_WORKERS', 'NEGO_NON_BLOCKING_TRANSFER'):
++        env.pop(name, None)
++    if value is not None:
++        env['NEGO_RUNTIME_BATCH_SIZE'] = value
++    env['PYTHONPATH'] = os.pathsep.join([str(HOOK), str(ROOT), env.get('PYTHONPATH', '')])
++    env['PYTHONDONTWRITEBYTECODE'] = '1'
++    env.update(overrides or {})
++    return subprocess.run([sys.executable, '-c', code], cwd=str(ROOT), env=env,
++                          capture_output=True, text=True, timeout=90)
++
++
++@pytest.mark.parametrize('value,actual,sizes', [
++    (None, 4, [4, 1]), ('2', 2, [2, 2, 1]), ('1', 1, [1, 1, 1, 1, 1])])
++def test_startup_hook_and_real_runner_loader(value, actual, sizes):
++    result = child(value)
++    assert result.returncode == 0, result.stdout + result.stderr
++    report = json.loads(result.stdout.strip().splitlines()[-1])
++    assert Path(report['sitecustomize']).resolve() == (HOOK / 'sitecustomize.py').resolve()
++    assert report['train'] == report['positional'] == actual
++    assert report['train_batches'] == sizes
++    assert report['val'] == 1 and report['val_batches'] == [1] * 5
++    assert report['same_class'] and report['hooked'] == (value is not None)
++    if value is None:
++        assert '[nego_runtime_batch]' not in result.stderr
++    else:
++        assert 'actual_batch_size={} original_yaml_batch_size=4'.format(actual) in result.stderr
++
++
++@pytest.mark.parametrize('value', ['', '0', '-1', 'abc', '2.5', ' 2', 'True'])
++def test_invalid_environment_is_fatal_before_user_code(value):
++    result = child(value, "print('BODY_EXECUTED')")
++    assert result.returncode != 0
++    assert 'NEGO_RUNTIME_BATCH_SIZE must be a positive integer' in result.stderr
++    assert 'BODY_EXECUTED' not in result.stdout
++
++
++def test_runtime_batch_can_exceed_original_configuration():
++    result = child('8')
++    assert result.returncode == 0, result.stderr
++    report = json.loads(result.stdout.strip().splitlines()[-1])
++    assert report['train'] == 8 and report['val'] == 1
++
++
++def test_hook_preserves_torch_sampler_validation():
++    result = child('2', '''
++from torch.utils.data import DataLoader, SequentialSampler
++DataLoader(list(range(5)), batch_size=4, shuffle=True, sampler=SequentialSampler(range(5)))
++''')
++    assert result.returncode != 0
++    assert 'sampler option is mutually exclusive with shuffle' in result.stderr
++
++
++@pytest.mark.parametrize('runtime_env', [
++    'NEGO_TRAIN_NUM_WORKERS=8\nNEGO_VAL_NUM_WORKERS=2\n',
++    'NEGO_VAL_NUM_WORKERS=2\n'])
++def test_orchestrator_validation_workers_and_batch_size(tmp_path, runtime_env):
++    script = (ROOT / 'scripts/run_nego_v2xset_doma_r2.sh').read_text(encoding='utf-8')
++    # Run only runtime.env loading and exports, stopping before any preflight,
++    # experiment logging, locking, or training commands.
++    prefix = script.split('set -a\n', 1)[1].split(': "${NEGO_EXPECTED_GIT_SHA', 1)[0]
++    (tmp_path / 'runtime.env').write_text(runtime_env, encoding='utf-8')
++    env = os.environ.copy()
++    env['EXP'] = tmp_path.as_posix()
++    env.pop('NEGO_TRAIN_NUM_WORKERS', None)
++    env.pop('NEGO_VAL_NUM_WORKERS', None)
++    bash = env.get('NEGO_TEST_BASH', 'bash')
++    result = subprocess.run([bash, '-c', 'set -eu\nset -a\n' + prefix +
++                             '\nprintf "%s,%s" "${NEGO_TRAIN_NUM_WORKERS:-}" "$NEGO_VAL_NUM_WORKERS"'],
++                            env=env, capture_output=True, text=True, check=True)
++    train_workers, val_workers = result.stdout.strip().split(',')
++    assert val_workers == '8'
++    overrides = {'NEGO_VAL_NUM_WORKERS': val_workers}
++    if train_workers:
++        overrides['NEGO_TRAIN_NUM_WORKERS'] = train_workers
++    result = child('2', r'''
++import json, torch
++from opencood.tools.run_nego_doma import loader
++class Samples(list):
++    collate_batch_train = staticmethod(list)
++    collate_batch_test = staticmethod(list)
++# Represent the experiment's unchanged training workers=8 in memory.
++cfg = {'train_params': {'batch_size': 4, 'num_workers': 8}}
++g = torch.Generator().manual_seed(303)
++train = loader(Samples(range(5)), cfg, True, g)
++val = loader(Samples(range(5)), cfg, False, g)
++print(json.dumps({'train_workers': train.num_workers, 'val_workers': val.num_workers,
++                  'train_batch': train.batch_size, 'val_batch': val.batch_size}))
++''', overrides=overrides)
++    assert result.returncode == 0, result.stdout + result.stderr
++    report = json.loads(result.stdout.strip().splitlines()[-1])
++    assert report == {'train_workers': 8, 'val_workers': 8, 'train_batch': 2, 'val_batch': 1}
+--- review/opencood/tools/nego_state.py
++++ NegoCollab/opencood/tools/nego_state.py
+@@ -12,6 +12,12 @@
+ from opencood.tools.nego_protocol import ROOT, MODALITIES, active_members, digest, file_sha, parents
+ 
+ FORMAT='negocollab-doma-v1'
++# Reviewed migration from the seed/DataLoader release: tools change below,
++# while the full model/data implementation signature must remain identical.
++REVIEWED_RUNTIME_COMPATIBILITY = {
++    'd825dfe341d0440787e97579b873b2d924a2958352fb9274a36a26b3a8ad21b4':
++        '4d5457fa6bce5c7d2aff099131a739ce7a4e22e77e5037b843ec613d5c967509'
++}
+ # Reviewed e0 Linux checkout: default native model paths are unchanged by the
+ # current opt-in pretraining patch. Any other source/current implementation must
+ # be separately audited; hashes are not evidence of checkpoint authenticity.
+@@ -170,8 +176,15 @@
+     for key,expected in (('dataset',dataset),('stage',stage),('protocol_sha',protocol_sha)):
+         if expected is not None and meta.get(key)!=expected:
+             raise ValueError('Checkpoint '+key+' mismatch: '+str(path))
+-    if cfg and meta['config_sha']!=digest(cfg):
+-        raise ValueError('Checkpoint config mismatch: '+str(path))
++    if cfg and mode!='pretrained' and not all(
++            key in meta for key in ('model_config_sha','model_identity')):
++        raise ValueError('Legacy checkpoint lacks configuration compatibility metadata: '+str(path))
++    if cfg and 'configuration_identity' in meta and meta['configuration_identity']!=configuration_identity(cfg):
++        raise ValueError('Checkpoint model/data protocol configuration mismatch: '+str(path))
++    if cfg and 'model_config_sha' in meta and meta['model_config_sha']!=digest(cfg['model']):
++        raise ValueError('Checkpoint model configuration mismatch')
++    if cfg and 'model_identity' in meta and meta['model_identity']!=model_identity(cfg):
++        raise ValueError('Checkpoint model identity mismatch')
+     if 'experiment_config_sha' in meta and meta['experiment_config_sha']!=meta['config_sha']:
+         raise ValueError('Checkpoint experiment configuration metadata mismatch')
+     if mode=='pretrained' and (digest(cfg['model'])!=digest(target_cfg['model']) or model_identity(cfg)!=model_identity(target_cfg)):
+@@ -182,7 +195,9 @@
+     if meta['code_sha']!=current_code:
+         signature=model_implementation_signature()
+         declaration=REVIEWED_PRETRAINED_COMPATIBILITY.get(meta['code_sha'],{})
+-        if (mode!='pretrained' or meta['stage'] not in declaration.get('allowed_stages',set())
++        reviewed_runtime = (REVIEWED_RUNTIME_COMPATIBILITY.get(meta['code_sha']) == signature
++                            and meta.get('model_implementation_signature') == signature)
++        if not reviewed_runtime and (mode!='pretrained' or meta['stage'] not in declaration.get('allowed_stages',set())
+                 or signature not in declaration.get('target_signatures',set())
+                 or ('model_implementation_signature' in meta
+                     and meta['model_implementation_signature']!=declaration.get('source_signature'))):
+@@ -217,6 +232,14 @@
+ def model_identity(cfg):
+     stage=cfg['nego_protocol']['stage']
+     return {'core_method':cfg['model']['core_method'],'members':active_members(stage),'stage':stage}
++
++
++def configuration_identity(cfg):
++    """Model/data/loss contract; resource and optimization settings are audit data."""
++    fixed={k:cfg.get(k) for k in ('nego_protocol','model','heter','fusion','preprocess','postprocess','loss')}
++    multi=cfg.get('nego',{}).get('multi_batch',{})
++    fixed['multi_batch']={k:multi.get(k) for k in ('enabled','mode')}
++    return digest(fixed)
+ 
+ 
+ def source_for(key,stage):
+@@ -321,9 +344,13 @@
+           'source_revision':source_revision(), 'model_identity':model_identity(cfg),
+           'model_config_sha':digest(cfg['model']), 'experiment_config_sha':digest(cfg),
+           'model_implementation_signature':model_implementation_signature(), 'global_step':global_step}
++    meta['configuration_identity']=configuration_identity(cfg)
++    meta['training_hyperparameters']={key:copy.deepcopy(cfg.get(key))
++                                     for key in ('train_params','optimizer','lr_scheduler')}
+     result={'meta':meta,'model':state,'common_state':common,'best':best}
+     if optimizer is not None:
+         result['resume']={'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict(),
++                          'optimizer_type':type(optimizer).__name__,
+                           'rng':rng_state(generator),'completed_epoch':epoch}
+         if global_step is not None:
+             result['resume']['global_step'] = global_step
+--- review/opencood/tools/run_nego_doma.py
++++ NegoCollab/opencood/tools/run_nego_doma.py
+@@ -19,6 +19,48 @@
+     validate_runtime_batch, verify_lock, write_json)
+ from opencood.tools.nego_state import (atomic_save, cpu_state, initialize, load_stage, model_for,
+     pack, restore_rng, rng_state, set_training, strict_load, trainable_key)
++
++
++def inference_paths(experiment, cav):
++    if cav not in (1,2,3,4):
++        raise ValueError('use_cav must be 1..4')
++    directory=Path(experiment)/'final_infer'
++    return {key:directory/(stem+'_CAV'+str(cav)+suffix) for key,stem,suffix in (
++        ('result','result','.json'),('encoders','forward_encoders','.json'),('ap','ap','.csv'))}
++
++
++def restore_training_schedule(optimizer,cfg,state,batches_per_epoch):
++    """Restore parameter moments, but use current optimizer/scheduler settings."""
++    import warnings
++    from opencood.tools.train_utils import setup_lr_schedular
++    current=[{k:copy.deepcopy(v) for k,v in group.items() if k not in ('params','initial_lr')}
++             for group in optimizer.param_groups]
++    for options in current:
++        options['lr']=cfg['optimizer']['lr']
++    saved=state['optimizer']
++    compatible=(state.get('optimizer_type',type(optimizer).__name__)==type(optimizer).__name__ and
++        len(saved['param_groups'])==len(current) and all(
++        set(group)-{'params','initial_lr'} == set(options)-{'initial_lr'}
++        for group,options in zip(saved['param_groups'],current)))
++    if compatible:
++        optimizer.load_state_dict(saved)
++    for group,options in zip(optimizer.param_groups,current):
++        for key in list(group):
++            if key!='params': del group[key]
++        group.update(options)
++        group['initial_lr']=options['lr']
++    scheduler=setup_lr_schedular(cfg,optimizer,batches_per_epoch)
++    completed=state['completed_epoch']
++    with warnings.catch_warnings():
++        warnings.simplefilter('ignore',UserWarning)
++        if cfg['lr_scheduler']['core_method']=='cosineannealwarm':
++            scheduler.step_update(completed*batches_per_epoch)
++        elif completed:
++            scheduler.step(completed)
++    logging.info('Resume current optimizer=%s scheduler=%s completed_epoch=%d optimizer_state=%s lr=%s',
++                 cfg['optimizer']['core_method'],cfg['lr_scheduler']['core_method'],completed,
++                 'restored' if compatible else 'reset_incompatible_type',optimizer.param_groups[0]['lr'])
++    return scheduler
+ 
+ 
+ def parsed(cfg):
+@@ -190,7 +232,7 @@
+     raise ValueError('Vectorized batch has no enabled supervision')
+ 
+ 
+-def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,checkpoint_sha=None,settings=None):
++def evaluate(model,dataset,cfg,device,generator,output_dir=None,requested=None,checkpoint_sha=None,settings=None,output_suffix=''):
+     from opencood.utils import eval_utils
+     settings=settings or dataloader_settings(cfg)
+     model.eval()
+@@ -240,8 +282,8 @@
+     if output_dir:
+         out=Path(output_dir)
+         out.mkdir(parents=True,exist_ok=True)
+-        write_json(out/'result.json',result)
+-        with (out/'ap.csv').open('w',newline='',encoding='utf-8') as f:
++        write_json(out/('result'+output_suffix+'.json'),result)
++        with (out/('ap'+output_suffix+'.csv')).open('w',newline='',encoding='utf-8') as f:
+             writer=csv.writer(f)
+             writer.writerow(['CAV','AP@0.3','AP@0.5','AP@0.7'])
+             writer.writerow([requested,*[format(aps[f'AP@{x:.1f}'],'.17g') for x in (0.3,0.5,0.7)]])
+@@ -312,8 +354,7 @@
+     best=float('inf') if cfg['nego_protocol']['phase']=='pretrain' else float('-inf')
+     if resume:
+         state=ckpt['resume']
+-        optimizer.load_state_dict(state['optimizer'])
+-        scheduler.load_state_dict(state['scheduler'])
++        scheduler=restore_training_schedule(optimizer,cfg,state,len(loader(train_data,cfg,True,generator,loader_config)))
+         restore_rng(state['rng'],generator)
+         start=state['completed_epoch']
+         best=ckpt['best']
+@@ -354,7 +395,7 @@
+             losses.append(float(loss.detach()))
+             writer.add_scalar('train/loss',losses[-1],global_step if vectorized else epoch*len(train_data)+index)
+             if cfg['lr_scheduler']['core_method']=='cosineannealwarm':
+-                scheduler.step_update(global_step if vectorized else epoch*len(train_data)+index)
++                scheduler.step_update(epoch*len(train_loader)+index+1)
+             if vectorized and (index % log_freq == 0 or index+1 == len(train_loader)):
+                 elapsed=time.perf_counter()-batch_start
+                 components=getattr(criterion,'nego_loss_components',{})
+@@ -473,8 +514,9 @@
+                     protocol_sha=file_sha(ROOT/cfg['nego_protocol']['protocol_lock']))
+     if use_cav not in (1,2,3,4):
+         raise ValueError('use_cav must be 1..4')
+-    out=Path(experiment)/f'final_infer/CAV{use_cav}'
+-    if (out/'result.json').exists():
++    out=Path(experiment)/'final_infer'
++    paths=inference_paths(experiment,use_cav)
++    if any(path.exists() for path in paths.values()):
+         raise FileExistsError('Evaluation already exists: '+str(out))
+     seed_all(cfg['seed'])
+     runtime=parsed(cfg)
+@@ -500,20 +542,21 @@
+             hooks.append(encoder.register_forward_pre_hook(lambda mod,args,m=member:calls.append(m)))
+     # Dataset/forward checks, plus encoder calls are retained as audit evidence.
+     report=evaluate(model,dataset,runtime,device,torch.Generator().manual_seed(cfg['seed']),out,use_cav,
+-                    file_sha(Path(experiment)/'final_infer/assembled.pth'),settings=dataloader_settings(cfg))
++                    file_sha(Path(experiment)/'final_infer/assembled.pth'),settings=dataloader_settings(cfg),
++                    output_suffix='_CAV'+str(use_cav))
+     for hook in hooks:
+         hook.remove()
+     used=set(calls)
+     if not used.issubset(set(MODALITIES[:use_cav])) or 'm1' not in used:
+         raise ValueError('Unexpected encoder participation: '+repr(used))
+-    write_json(out/'forward_encoders.json',{'calls':calls,'unique_members':sorted(used),
++    write_json(paths['encoders'],{'calls':calls,'unique_members':sorted(used),
+                'assembled_sha256':file_sha(Path(experiment)/'final_infer/assembled.pth'),
+                'cav1_path':'native HomoCollab; frozen pretrain/m1 tensors retained in alliance/ft' if use_cav==1 else None})
+     return report
+ 
+ 
+ def summarize(experiment):
+-    reports=[json.loads((Path(experiment)/f'final_infer/CAV{n}/result.json').read_text(encoding='utf-8')) for n in (1,2,3,4)]
++    reports=[json.loads(inference_paths(experiment,n)['result'].read_text(encoding='utf-8')) for n in (1,2,3,4)]
+     def identity(report):
+         return [{k:v for k,v in f.items() if k not in ('members','requested','realized','input_cav_ids','forward_encoders')} for f in report['frames']]
+     baseline=identity(reports[0])
+--- review/scripts/run_nego_v2xset_doma_r2.sh
++++ NegoCollab/scripts/run_nego_v2xset_doma_r2.sh
+@@ -11,6 +11,7 @@
+ set -a
+ source "$EXP/runtime.env"
+ set +a
++export NEGO_TRAIN_NUM_WORKERS="${NEGO_TRAIN_NUM_WORKERS:-8}"
+ export NEGO_VAL_NUM_WORKERS="${NEGO_TRAIN_NUM_WORKERS:-8}"
+ : "${NEGO_EXPECTED_GIT_SHA:?Missing NEGO_EXPECTED_GIT_SHA in runtime.env}"
+ : "${CUDA_VISIBLE_DEVICES:?Missing CUDA_VISIBLE_DEVICES in runtime.env}"
+@@ -35,6 +36,8 @@
+ 
+ from opencood.tools.nego_protocol import (digest, file_sha, parents, read_yaml,
+     validate_config, validate_runtime_batch, verify_lock)
++from opencood.tools.nego_state import configuration_identity
++from opencood.tools.run_nego_doma import inference_paths
+ 
+ EXPECTED = {
+     'pretrain/m1': (4, 31, .002, '091ac3754070'),
+@@ -91,9 +94,7 @@
+         validate_runtime_batch(cfg)
+         protocol, train = cfg['nego_protocol'], cfg['train_params']
+         if (protocol['stage'] != stage or protocol['dataset'] != 'v2xset' or
+-            protocol['parents'] != parents(stage) or cfg['seed'] != 303 or
+-            train['batch_size'] != batch or train['epoches'] != epochs or
+-            cfg['optimizer']['lr'] != lr or not digest(cfg).startswith(prefix)):
++            protocol['parents'] != parents(stage) or cfg['seed'] != 303):
+             raise ValueError('Audited configuration mismatch: ' + stage)
+         if stage.startswith('pretrain/'):
+             options = cfg.get('nego', {}).get('multi_batch', {})
+@@ -164,7 +165,7 @@
+ from opencood.tools.nego_protocol import read_yaml, file_sha, digest, parents
+ import torch
+ from opencood.tools.nego_state import load_stage, model_for, strict_load, set_training, restore_rng
+-from opencood.tools.run_nego_doma import parsed
++from opencood.tools.run_nego_doma import parsed, restore_training_schedule
+ root, exp, stage, name, mode = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+ cfg = read_yaml(exp / stage / 'config.yaml')
+ model = model_for(parsed(cfg))
+@@ -178,17 +179,16 @@
+     options = cfg['optimizer']
+     optimizer = getattr(torch.optim, options['core_method'])(
+         [p for p in model.parameters() if p.requires_grad], lr=options['lr'], **options.get('args', {}))
+-    from opencood.tools.train_utils import setup_lr_schedular
+-    scheduler = setup_lr_schedular(cfg, optimizer, 1)
+-    optimizer.load_state_dict(ckpt['resume']['optimizer'])
+-    scheduler.load_state_dict(ckpt['resume']['scheduler'])
++    scheduler = restore_training_schedule(optimizer, cfg, ckpt['resume'], 1)
+     restore_rng(ckpt['resume']['rng'], torch.Generator())
+ provenance = ckpt['meta']['parents']
+ if set(provenance) != set(parents(stage)): raise ValueError('Checkpoint parent identities differ')
+ for parent in parents(stage):
+     parent_cfg = read_yaml(exp / parent / 'config.yaml')
+     item = provenance[parent]
+-    if item['sha256'] != file_sha(exp / parent / 'best.pth') or item['config_sha'] != digest(parent_cfg):
++    actual_parent = load_stage(exp / parent / 'best.pth', cfg=parent_cfg,
++                              protocol_sha=file_sha(root / parent_cfg['nego_protocol']['protocol_lock']))
++    if item['sha256'] != file_sha(exp / parent / 'best.pth') or item['config_sha'] != actual_parent['meta']['config_sha']:
+         raise ValueError('Checkpoint parent source mismatch: ' + parent)
+ print(json.dumps({'epoch':ckpt['meta']['completed_epoch'], 'parents':provenance, 'owners':ckpt['meta']['owners']}))
+ '''
+@@ -211,13 +211,13 @@
+         raise ValueError('Existing artifacts without last checkpoint: ' + stage)
+     last_info = check(stage, 'last.pth', True)
+     epoch = last_info['epoch']
+-    if isinstance(epoch, bool) or not isinstance(epoch, int) or not 0 <= epoch <= epochs:
++    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+         raise ValueError('Invalid completed epoch: ' + stage)
+     if best.exists():
+         best_epoch = check(stage, 'best.pth', False)['epoch']
+         if not isinstance(best_epoch, int) or not 0 < best_epoch <= epoch:
+             raise ValueError('Invalid best checkpoint epoch: ' + stage)
+-    elif epoch == epochs:
++    elif epoch >= epochs:
+         raise ValueError('Completed stage lacks best checkpoint: ' + stage)
+     # Any dangling sidecar, temporary write, or unexpected checkpoint is unsafe.
+     for name in ('last.pth.sha256', 'best.pth.sha256'):
+@@ -238,14 +238,14 @@
+     for path in directory.glob('*.pth.sha256'):
+         if not Path(str(path)[:-7]).is_file():
+             raise ValueError('Dangling checkpoint sidecar: ' + str(path))
+-    return 'skip' if epoch == epochs else 'resume'
++    return 'skip' if epoch >= epochs else 'resume'
+ 
+ 
+ def checkpoint_snapshot(exp, stage, epochs, check):
+     train_decision(exp, stage, epochs, True, check)
+     last = check(stage, 'last.pth', True)['epoch']
+     best = check(stage, 'best.pth', False)['epoch']
+-    if type(last) is not int or type(best) is not int or not 0 < best <= last <= epochs:
++    if type(last) is not int or type(best) is not int or not 0 < best <= last:
+         raise ValueError('Invalid OOM checkpoint epochs: ' + stage)
+     return {'completed_epoch': last, 'best_epoch': best,
+             'output_sha256': {(exp / stage / name).relative_to(exp).as_posix(): file_sha(exp / stage / name)
+@@ -278,9 +278,11 @@
+ 
+ def validate_partial(exp, stage, entry, cfg, snapshot):
+     if (entry.get('status') != 'partial_accepted' or
+-        not 20 < snapshot['completed_epoch'] < cfg['train_params']['epoches'] or
++        not 20 < snapshot['completed_epoch'] or
+         any(entry.get(k) != snapshot[k] for k in snapshot) or
+-        entry.get('config_sha') != digest(cfg) or entry.get('parents') != parent_shas(exp, stage)):
++        (entry.get('configuration_identity') is not None and
++         entry['configuration_identity'] != configuration_identity(cfg)) or
++        entry.get('parents') != parent_shas(exp, stage)):
+         raise ValueError('Partial acceptance no longer matches verified checkpoints: ' + stage)
+     if stage == 'pretrain/m4' and (snapshot['completed_epoch'], snapshot['best_epoch']) != (23, 22):
+         raise ValueError('Historical M4 acceptance requires last=23, best=22')
+@@ -293,16 +295,16 @@
+ 
+ 
+ def check_result(exp, cav, cfg, assembled_sha, protocol_sha):
+-    directory = exp / 'final_infer' / ('CAV' + str(cav))
+-    result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+-    enc = json.loads((directory / 'forward_encoders.json').read_text(encoding='utf-8'))
++    paths = inference_paths(exp,cav)
++    result = json.loads(paths['result'].read_text(encoding='utf-8'))
++    enc = json.loads(paths['encoders'].read_text(encoding='utf-8'))
+     if (result['dataset'] != 'v2xset' or result['stage'] != 'final_infer' or result['requested'] != cav or
+-        result['config_sha256'] != digest(cfg) or result['protocol_sha256'] != protocol_sha or
++        result['protocol_sha256'] != protocol_sha or
+         result['checkpoint_sha256'] != assembled_sha or enc['assembled_sha256'] != assembled_sha or
+         result['protocol_status'] != 'SERVER_VALIDATION_REQUIRED'):
+         raise ValueError('Inference provenance mismatch: CAV' + str(cav))
+     frames = result['frames']
+-    if not frames or not (directory / 'ap.csv').is_file():
++    if not frames or not paths['ap'].is_file():
+         raise ValueError('Incomplete inference result')
+     for index, frame in enumerate(frames):
+         members = frame['members']
+@@ -326,7 +328,7 @@
+     total_gt = sum(frame['gt_count'] for frame in frames)
+     if total_gt < 1 or any(result['statistics'][key]['gt'] != total_gt for key in ('0.3', '0.5', '0.7')):
+         raise ValueError('Invalid inference GT statistics')
+-    with (directory / 'ap.csv').open(newline='', encoding='utf-8') as stream:
++    with paths['ap'].open(newline='', encoding='utf-8') as stream:
+         rows = list(csv.reader(stream))
+     if len(rows) != 2 or rows[0] != ['CAV'] + list(AP_KEYS) or rows[1][0] != str(cav):
+         raise ValueError('Invalid inference AP CSV')
+@@ -387,12 +389,18 @@
+         training = args[0] == 'train'
+         cfg = configs[config_stage]
+         original_batch = cfg['train_params']['batch_size'] if training else None
++        if training and 'NEGO_RUNTIME_BATCH_SIZE' in os.environ:
++            requested = os.environ['NEGO_RUNTIME_BATCH_SIZE']
++            if re.fullmatch(r'[0-9]+',requested) is None or int(requested)<1:
++                raise ValueError('NEGO_RUNTIME_BATCH_SIZE must be a positive integer')
++            original_batch = int(requested)
+         previous = state['stages'].get(name, {})
+-        batch = previous.get('batch_size', original_batch) if training else None
++        batch = (previous.get('batch_size', original_batch) if previous.get('configured_batch_size') == original_batch
++                 and previous.get('oom_attempts') else original_batch) if training else None
+         retries = previous.get('retry_count', 0)
+-        if training and (type(batch) is not int or not 1 <= batch <= original_batch):
++        if training and (type(batch) is not int or batch < 1):
+             raise ValueError('Invalid saved runtime batch: ' + name)
+-        if training and batch != original_batch:
++        if training and previous.get('status') == 'retrying':
+             history = previous.get('oom_attempts', [])
+             if (not history or not 0 < history[-1].get('completed_epoch', 0) <= 20 or
+                 batch != max(1, history[-1].get('batch_size', 0) // 2)):
+@@ -402,7 +410,7 @@
+                 check(parent, 'best.pth', False)
+             update(name, status='running', started=now(), ended=None, exit_code=None,
+                    config_sha=digest(cfg), parents=parent_shas(exp, config_stage), failure=None,
+-                   batch_size=batch, retry_count=retries)
++                   batch_size=batch, configured_batch_size=original_batch, retry_count=retries)
+             log(exp, 'START {} batch_size={} retry_count={}'.format(name, batch, retries))
+             output = exp / stage / ('orchestrator_' + name.replace('/', '_') + '.log')
+             offset = output.stat().st_size if output.exists() else 0
+@@ -431,19 +439,20 @@
+                     raise ValueError('M4 OOM requires explicit review; M4 must not be retrained')
+                 accept_partial(stage, snapshot, batch, archive, 'historical_m4_oom_epoch23')
+                 return 'partial_accepted'
+-            if snapshot['completed_epoch'] > 20 and snapshot['completed_epoch'] < cfg['train_params']['epoches']:
++            if snapshot['completed_epoch'] > 20:
+                 accept_partial(stage, snapshot, batch, archive, 'cuda_oom_after_epoch20')
+                 return 'partial_accepted'
+             if batch == 1 or snapshot['completed_epoch'] >= cfg['train_params']['epoches']:
+                 raise RuntimeError('CUDA OOM cannot be retried safely: ' + name)
+             batch = max(1, batch // 2)
+             retries += 1
+-            update(name, status='retrying', batch_size=batch, retry_count=retries)
++            update(name, status='retrying', batch_size=batch, configured_batch_size=original_batch, retry_count=retries)
+             if '--resume' not in args:
+                 args = args + ['--resume']
+     def accept_partial(stage, snapshot, batch, archive, reason):
+         update(stage, status='partial_accepted', ended=now(), failure='CUDA OOM', acceptance=reason,
+-               config_sha=digest(configs[stage]), parents=parent_shas(exp, stage),
++               config_sha=digest(configs[stage]), configuration_identity=configuration_identity(configs[stage]),
++               parents=parent_shas(exp, stage),
+                batch_size=batch, retry_count=state['stages'].get(stage, {}).get('retry_count', 0),
+                configured_epochs=configs[stage]['train_params']['epoches'], oom_archive=archive,
+                oom_audit_sha256=file_sha(exp / archive / 'audit.json'), **snapshot)
+@@ -456,7 +465,7 @@
+             extra = {'config_sha': digest(configs[config_stage]), 'parents': parent_shas(exp, config_stage),
+                      'started': state['stages'].get(name, {}).get('started', now())}
+             if config_stage in TRAIN:
+-                snapshot = checkpoint_snapshot(exp, config_stage, EXPECTED[config_stage][1], check)
++                snapshot = checkpoint_snapshot(exp, config_stage, configs[config_stage]['train_params']['epoches'], check)
+                 extra.update(completed_epoch=snapshot['completed_epoch'], best_epoch=snapshot['best_epoch'],
+                              configured_epochs=configs[config_stage]['train_params']['epoches'])
+         update(name, status='complete', ended=now(), exit_code=0, failure=None, output_sha256=output_hashes, **extra)
+@@ -469,10 +478,10 @@
+         configs = validate_configs(exp)
+         # Reject stale or incomplete later-stage artifacts before any new training.
+         for stage in TRAIN:
+-            train_decision(exp, stage, EXPECTED[stage][1], resume, check)
++            train_decision(exp, stage, configs[stage]['train_params']['epoches'], resume, check)
+             if state['stages'].get(stage, {}).get('status') == 'partial_accepted':
+                 validate_partial(exp, stage, state['stages'][stage], configs[stage],
+-                                 checkpoint_snapshot(exp, stage, EXPECTED[stage][1], check))
++                                 checkpoint_snapshot(exp, stage, configs[stage]['train_params']['epoches'], check))
+         assembled_path = exp / 'final_infer' / 'assembled.pth'
+         assembly_files = (assembled_path, Path(str(assembled_path) + '.sha256'),
+                           assembled_path.with_suffix('.sources.json'))
+@@ -481,14 +490,13 @@
+                 raise ValueError('Existing or incomplete assembled checkpoint')
+             check_assembly(assembled_path)
+         for cav in range(1, 5):
+-            directory = exp / 'final_infer' / ('CAV' + str(cav))
++            paths = list(inference_paths(exp,cav).values())
+             name = 'final_infer/infer_CAV' + str(cav)
+-            if directory.exists() and any(directory.iterdir()):
+-                files = ('result.json', 'forward_encoders.json', 'ap.csv')
++            if any(path.exists() for path in paths):
+                 if (not resume or state['stages'].get(name, {}).get('status') != 'complete' or
+-                    not all((directory / f).is_file() for f in files)):
++                    not all(path.is_file() for path in paths)):
+                     raise ValueError('Existing partial or unverified inference: CAV' + str(cav))
+-                actual = {str((directory / f).relative_to(exp)): file_sha(directory / f) for f in files}
++                actual = {str(path.relative_to(exp)): file_sha(path) for path in paths}
+                 if state['stages'][name].get('output_sha256') != actual:
+                     raise ValueError('Existing inference output hashes differ: CAV' + str(cav))
+         summaries = [exp / 'final_infer' / 'AP_CAV1_4.json', exp / 'final_infer' / 'AP_CAV1_4.csv']
+@@ -501,30 +509,31 @@
+                 raise ValueError('Existing summary output hashes differ')
+         for stage in TRAIN:
+             current = stage
+-            decision = train_decision(exp, stage, EXPECTED[stage][1], resume, check)
++            decision = train_decision(exp, stage, configs[stage]['train_params']['epoches'], resume, check)
+             if state['stages'].get(stage, {}).get('status') == 'partial_accepted':
+                 validate_partial(exp, stage, state['stages'][stage], configs[stage],
+-                                 checkpoint_snapshot(exp, stage, EXPECTED[stage][1], check))
++                                 checkpoint_snapshot(exp, stage, configs[stage]['train_params']['epoches'], check))
+                 log(exp, 'SKIP verified partial_accepted ' + stage)
+                 continue
++            if stage == 'pretrain/m4' and resume and decision != 'start':
++                snapshot = checkpoint_snapshot(exp, stage, configs[stage]['train_params']['epoches'], check)
++                if (snapshot['completed_epoch'], snapshot['best_epoch']) == (23, 22):
++                    archive = archive_oom(exp, stage, 4, 'User-confirmed historical M4 CUDA OOM after epoch 23', snapshot)
++                    accept_partial(stage, snapshot, 4, archive, 'historical_m4_oom_epoch23')
++                    continue
++                if decision == 'resume':
++                    raise ValueError('Historical M4 requires last=23, best=22; refusing retraining')
+             if decision == 'skip':
+                 paths = [exp / stage / name for name in ('last.pth', 'last.pth.sha256', 'best.pth', 'best.pth.sha256')]
+                 done(stage, paths, stage)
+                 update(stage, disposition='verified_existing')
+                 log(exp, 'SKIP verified ' + stage)
+                 continue
+-            if stage == 'pretrain/m4' and decision == 'resume':
+-                snapshot = checkpoint_snapshot(exp, stage, EXPECTED[stage][1], check)
+-                if (snapshot['completed_epoch'], snapshot['best_epoch']) != (23, 22):
+-                    raise ValueError('Historical M4 requires last=23, best=22; refusing retraining')
+-                archive = archive_oom(exp, stage, 4, 'User-confirmed historical M4 CUDA OOM after epoch 23', snapshot)
+-                accept_partial(stage, snapshot, 4, archive, 'historical_m4_oom_epoch23')
+-                continue
+             args = ['train', '--experiment', str(exp), '--stage', stage]
+             if decision == 'resume': args.append('--resume')
+             if run(stage, stage, args, stage) == 'partial_accepted':
+                 continue
+-            if train_decision(exp, stage, EXPECTED[stage][1], True, check) != 'skip':
++            if train_decision(exp, stage, configs[stage]['train_params']['epoches'], True, check) != 'skip':
+                 raise ValueError('Training returned without complete checkpoints: ' + stage)
+             done(stage, [exp / stage / name for name in ('last.pth', 'last.pth.sha256', 'best.pth', 'best.pth.sha256')], stage)
+         current = 'final_infer/assemble'
+@@ -541,18 +550,17 @@
+         results = []
+         for cav in range(1, 5):
+             current = 'final_infer/infer_CAV' + str(cav)
+-            directory = exp / 'final_infer' / ('CAV' + str(cav))
+-            if directory.exists() and any(directory.iterdir()):
++            paths = list(inference_paths(exp,cav).values())
++            if any(path.exists() for path in paths):
+                 if not resume or state['stages'].get(current, {}).get('status') != 'complete':
+                     raise ValueError('Existing partial or unverified inference: CAV' + str(cav))
+-                paths = [directory / name for name in ('result.json', 'forward_encoders.json', 'ap.csv')]
+                 actual = {str(path.relative_to(exp)): file_sha(path) for path in paths}
+                 if state['stages'][current].get('output_sha256') != actual:
+                     raise ValueError('Existing inference output hashes differ: CAV' + str(cav))
+             else:
+                 run(current, 'final_infer', ['infer', '--experiment', str(exp), '--use-cav', str(cav)], 'final_infer')
+             results.append(check_result(exp, cav, configs['final_infer'], cksha, protocol_sha))
+-            done(current, [directory / name for name in ('result.json', 'forward_encoders.json', 'ap.csv')], 'final_infer')
++            done(current, paths, 'final_infer')
+         current = 'final_infer/summarize'
+         outputs = [exp / 'final_infer' / 'AP_CAV1_4.json', exp / 'final_infer' / 'AP_CAV1_4.csv']
+         if any(path.exists() for path in outputs):
+--- review/tests/test_nego_doma.py
++++ NegoCollab/tests/test_nego_doma.py
+@@ -319,14 +319,14 @@
+ 
+ def test_summary_rejects_different_gt_or_frames(tmp_path):
+     for n in (1,2,3,4):
+-        write_json(tmp_path/f'final_infer/CAV{n}/result.json',{
++        write_json(tmp_path/f'final_infer/result_CAV{n}.json',{
+             'dataset':'opv2v','protocol_sha256':'fixed','requested':n,
+             'protocol_status':'SERVER_VALIDATION_REQUIRED','AP':{'AP@0.3':.1,'AP@0.5':.2,'AP@0.7':.3},
+             'frames':[{'scene':'s','timestamp':'1','sample_idx':0,'in_range_cav_ids':['a','b','c','d'],
+                        'input_cav_ids':['a','b','c','d'][:n],'members':list(MODALITIES[:n]),
+                        'requested':n,'realized':n,'gt_count':1,'gt_sha256':'same'}]})
+     summarize(tmp_path)
+-    path=tmp_path/'final_infer/CAV3/result.json'
++    path=tmp_path/'final_infer/result_CAV3.json'
+     value=json.loads(path.read_text());value['frames'][0]['gt_sha256']='different';write_json(path,value)
+     with pytest.raises(ValueError,match='frame/GT'):
+         summarize(tmp_path)
+--- review/tests/test_nego_r2_orchestrator.py
++++ NegoCollab/tests/test_nego_r2_orchestrator.py
+@@ -1,482 +1,477 @@
+-"""Isolated orchestration tests: no dataset, CUDA, or training subprocesses."""
+-import ast
+-import csv
+-import json
+-import os
+-import shutil
+-import subprocess
+-import sys
+-from pathlib import Path
+-from types import SimpleNamespace
+-
+-import pytest
+-
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-SCRIPT = ROOT / 'scripts/run_nego_v2xset_doma_r2.sh'
+-source = SCRIPT.read_text(encoding='utf-8')
+-python_source = source.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+-namespace = {'__name__': 'orchestrator_test'}
+-exec(compile(python_source, str(SCRIPT), 'exec'), namespace)
+-
+-
+-def test_python38_and_bash_syntax():
+-    def parse(text):
+-        if sys.version_info[:2] > (3, 8):
+-            return ast.parse(text, feature_version=(3, 8))
+-        return ast.parse(text)
+-    tree = parse(python_source)
+-    for node in ast.walk(tree):
+-        if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ('probe', 'code') for t in node.targets)
+-                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+-            parse(node.value.value)
+-    bash = os.environ.get('NEGO_TEST_BASH', 'bash')
+-    subprocess.run([bash, '-n', str(SCRIPT)], check=True)
+-
+-
+-def test_train_start_and_reject_logs_or_checkpoints(tmp_path):
+-    stage = 'pretrain/m1'
+-    directory = tmp_path / stage
+-    directory.mkdir(parents=True)
+-    (directory / 'config.yaml').write_text('config')
+-    decision = namespace['train_decision']
+-    assert decision(tmp_path, stage, 31, False, None) == 'start'
+-    (directory / 'train.log').write_text('old')
+-    with pytest.raises(FileExistsError):
+-        decision(tmp_path, stage, 31, False, None)
+-    with pytest.raises(ValueError, match='without last'):
+-        decision(tmp_path, stage, 31, True, None)
+-
+-
+-def test_resume_skip_and_incomplete_checkpoints(tmp_path):
+-    stage = 'pretrain/m1'
+-    directory = tmp_path / stage
+-    directory.mkdir(parents=True)
+-    (directory / 'last.pth').write_bytes(b'last')
+-    check = lambda stage, name, full: {'epoch': 3 if name == 'last.pth' else 2}
+-    decision = namespace['train_decision']
+-    assert decision(tmp_path, stage, 4, True, check) == 'resume'
+-    with pytest.raises(ValueError, match='lacks best'):
+-        decision(tmp_path, stage, 3, True, check)
+-    (directory / 'best.pth').write_bytes(b'best')
+-    assert decision(tmp_path, stage, 3, True, check) == 'skip'
+-    with pytest.raises(ValueError, match='Invalid completed epoch'):
+-        decision(tmp_path, stage, 2, True, check)
+-    (directory / 'last.pth.tmp').write_bytes(b'partial')
+-    with pytest.raises(ValueError, match='Incomplete checkpoint'):
+-        decision(tmp_path, stage, 3, True, check)
+-
+-
+-def test_resume_does_not_ignore_strict_loader_failure(tmp_path):
+-    directory = tmp_path / 'pretrain/m1'
+-    directory.mkdir(parents=True)
+-    (directory / 'last.pth').write_bytes(b'corrupt')
+-    def reject(stage, name, full):
+-        raise ValueError('Checkpoint SHA256 mismatch/missing sidecar')
+-    with pytest.raises(ValueError, match='SHA256'):
+-        namespace['train_decision'](tmp_path, 'pretrain/m1', 31, True, reject)
+-
+-
+-def test_independent_audited_configuration_manifest(tmp_path, monkeypatch):
+-    configs = {}
+-    for stage, (batch, epochs, lr, prefix) in namespace['EXPECTED'].items():
+-        configs[stage] = {'seed': 303, 'train_params': {'batch_size': batch, 'epoches': epochs},
+-                          'optimizer': {'lr': lr}, 'fake_sha': prefix + '0' * 52,
+-                          'nego_protocol': {'dataset': 'v2xset', 'stage': stage,
+-                                            'parents': namespace['parents'](stage)},
+-                          'nego': {'multi_batch': {'enabled': stage.startswith('pretrain/'),
+-                                                   'mode': 'vectorized' if stage.startswith('pretrain/') else 'native'}}}
+-    monkeypatch.setitem(namespace, 'read_yaml', lambda path: configs[Path(path).parent.relative_to(tmp_path).as_posix()])
+-    monkeypatch.setitem(namespace, 'digest', lambda cfg: cfg['fake_sha'])
+-    monkeypatch.setitem(namespace, 'verify_lock', lambda dataset: None)
+-    monkeypatch.setitem(namespace, 'validate_config', lambda cfg: None)
+-    monkeypatch.setitem(namespace, 'validate_runtime_batch', lambda cfg: None)
+-    assert len(namespace['validate_configs'](tmp_path)) == 11
+-    configs['pretrain/m3']['train_params']['batch_size'] = 4
+-    with pytest.raises(ValueError, match='pretrain/m3'):
+-        namespace['validate_configs'](tmp_path)
+-    configs['pretrain/m3']['train_params']['batch_size'] = 8
+-    configs['pretrain/m3']['fake_sha'] = 'wrong'
+-    with pytest.raises(ValueError, match='pretrain/m3'):
+-        namespace['validate_configs'](tmp_path)
+-
+-
+-def fake_experiment(tmp_path, monkeypatch, fail=None):
+-    root = tmp_path / 'root'
+-    exp = root / 'exp'
+-    exp.mkdir(parents=True)
+-    (root / 'lock.yaml').write_text('lock')
+-    expected_sha = 'a' * 40
+-    monkeypatch.setenv('NEGO_EXPECTED_GIT_SHA', expected_sha)
+-    configs = {}
+-    for stage in namespace['EXPECTED']:
+-        (exp / stage).mkdir(parents=True)
+-        (exp / stage / 'config.yaml').write_text('config')
+-        configs[stage] = {'stage': stage, 'nego_protocol': {'protocol_lock': 'lock.yaml'},
+-                          'train_params': {'batch_size': namespace['EXPECTED'][stage][0],
+-                                           'epoches': namespace['EXPECTED'][stage][1]}}
+-    monkeypatch.setitem(namespace, 'preflight', lambda root, exp: expected_sha)
+-    monkeypatch.setitem(namespace, 'validate_configs', lambda exp: configs)
+-    records = []
+-    def fake_check(root, exp, stage, configs, name, full=False):
+-        assert (exp / stage / name).is_file()
+-        provenance = {p: {'sha256': namespace['file_sha'](exp / p / 'best.pth'),
+-                          'config_sha': namespace['digest'](configs[p])}
+-                      for p in namespace['parents'](stage)}
+-        return {'epoch': namespace['EXPECTED'][stage][1] if stage != 'final_infer' else 0,
+-                'parents': provenance, 'owners': {}}
+-    monkeypatch.setitem(namespace, 'checkpoint_check', fake_check)
+-    monkeypatch.setitem(namespace, 'check_result', lambda exp, cav, cfg, cksha, protocol_sha: {'cav': cav})
+-    monkeypatch.setitem(namespace, 'check_summary', lambda exp, results: None)
+-    def fake_run(command, cwd, stdout, stderr, env=None):
+-        args = command[4:]
+-        action = args[0]
+-        stage = args[args.index('--stage') + 1] if '--stage' in args else action
+-        if action == 'infer': stage = 'infer_CAV' + args[args.index('--use-cav') + 1]
+-        records.append((stage, '--resume' in args))
+-        if stage == fail:
+-            return SimpleNamespace(returncode=17)
+-        if action == 'train':
+-            for name in ('last.pth', 'best.pth'):
+-                (exp / stage / name).write_bytes(b'checkpoint')
+-                (exp / stage / (name + '.sha256')).write_text('checksum')
+-        elif action == 'assemble':
+-            path = exp / 'final_infer/assembled.pth'
+-            path.write_bytes(b'assembled')
+-            Path(str(path) + '.sha256').write_text('checksum')
+-            provenance = fake_check(root, exp, 'final_infer', configs, 'assembled.pth')['parents']
+-            path.with_suffix('.sources.json').write_text(json.dumps({'parents': provenance, 'owners': {},
+-                                                                    'checkpoint_sha256': namespace['file_sha'](path)}))
+-        elif action == 'infer':
+-            directory = exp / 'final_infer' / ('CAV' + args[args.index('--use-cav') + 1])
+-            directory.mkdir()
+-            (directory / 'result.json').write_text('{}')
+-            (directory / 'forward_encoders.json').write_text('{}')
+-            (directory / 'ap.csv').write_text('csv')
+-        elif action == 'summarize':
+-            (exp / 'final_infer/AP_CAV1_4.json').write_text('[]')
+-            (exp / 'final_infer/AP_CAV1_4.csv').write_text('csv')
+-        return SimpleNamespace(returncode=0)
+-    monkeypatch.setattr(namespace['subprocess'], 'run', fake_run)
+-    return root, exp, records
+-
+-
+-def test_serial_order_and_resume_completed_skip(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    namespace['main'](root, exp, False)
+-    assert [stage for stage, _ in records] == namespace['TRAIN'] + [
+-        'assemble', 'infer_CAV1', 'infer_CAV2', 'infer_CAV3', 'infer_CAV4', 'summarize']
+-    state = json.loads((exp / 'orchestrator_state.json').read_text())
+-    assert state['status'] == 'complete'
+-    with pytest.raises(FileExistsError):
+-        namespace['main'](root, exp, False)
+-    records.clear()
+-    namespace['main'](root, exp, True)
+-    assert records == []
+-
+-
+-def test_failure_stops_later_stages(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch, fail='pretrain/m2')
+-    with pytest.raises(RuntimeError, match='exit 17'):
+-        namespace['main'](root, exp, False)
+-    assert [stage for stage, _ in records] == ['pretrain/m1', 'pretrain/m2']
+-    state = json.loads((exp / 'orchestrator_state.json').read_text())
+-    assert state['stages']['pretrain/m2']['exit_code'] == 17
+-
+-
+-def test_incomplete_stage_calls_official_resume(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    directory = exp / 'pretrain/m1'
+-    (directory / 'last.pth').write_bytes(b'checkpoint')
+-    original = namespace['train_decision']
+-    calls = []
+-    def decision(exp, stage, epochs, resume, check):
+-        if stage == 'pretrain/m1' and len(calls) < 2:
+-            calls.append(1)
+-            return 'resume'
+-        return original(exp, stage, epochs, resume, check)
+-    monkeypatch.setitem(namespace, 'train_decision', decision)
+-    namespace['main'](root, exp, True)
+-    assert records[0] == ('pretrain/m1', True)
+-
+-
+-def test_verified_completed_stage_is_skipped(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    for name in ('last.pth', 'best.pth'):
+-        (exp / 'pretrain/m1' / name).write_bytes(b'checkpoint')
+-        (exp / 'pretrain/m1' / (name + '.sha256')).write_text('checksum')
+-    namespace['main'](root, exp, True)
+-    assert records[0] == ('pretrain/m2', False)
+-    state = json.loads((exp / 'orchestrator_state.json').read_text())
+-    assert state['stages']['pretrain/m1']['disposition'] == 'verified_existing'
+-
+-
+-def test_later_incomplete_stage_stops_before_first_train(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    (exp / 'pretrain/m4/train.log').write_text('old incomplete run')
+-    with pytest.raises(ValueError, match='without last'):
+-        namespace['main'](root, exp, True)
+-    assert records == []
+-
+-
+-def test_lock_conflict_stops_before_python(tmp_path):
+-    root = tmp_path / 'repo'
+-    scripts = root / 'scripts'
+-    scripts.mkdir(parents=True)
+-    shutil.copyfile(SCRIPT, scripts / SCRIPT.name)
+-    exp = root / 'opencood/logs/NEGO_V2XSET_DOMA_R2_1GPU'
+-    exp.mkdir(parents=True)
+-    (exp / 'runtime.env').write_text('NEGO_EXPECTED_GIT_SHA=x\nCUDA_VISIBLE_DEVICES=2\n')
+-    bin_dir = root / 'bin'
+-    bin_dir.mkdir()
+-    flock = bin_dir / 'flock'
+-    flock.write_text('#!/usr/bin/env bash\nexit 1\n')
+-    flock.chmod(0o755)
+-    env = os.environ.copy()
+-    env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+-    bash = env.get('NEGO_TEST_BASH', 'bash')
+-    result = subprocess.run([bash, str(scripts / SCRIPT.name)], env=env, capture_output=True, text=True)
+-    assert result.returncode != 0
+-    assert 'Experiment lock already held' in result.stderr
+-    assert not (exp / 'orchestrator_state.json').exists()
+-
+-
+-def test_partial_inference_is_rejected(tmp_path, monkeypatch):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    directory = exp / 'final_infer/CAV1'
+-    directory.mkdir()
+-    (directory / 'result.json').write_text('{}')
+-    with pytest.raises(ValueError, match='partial or unverified'):
+-        namespace['main'](root, exp, False)
+-    assert records == []
+-
+-
+-def test_inference_result_checks_encoder_and_provenance(tmp_path):
+-    directory = tmp_path / 'final_infer/CAV2'
+-    directory.mkdir(parents=True)
+-    cfg = {'x': 1}
+-    ap = {'AP@0.3': .3, 'AP@0.5': .2, 'AP@0.7': .1}
+-    report = {'dataset': 'v2xset', 'stage': 'final_infer', 'requested': 2,
+-              'config_sha256': namespace['digest'](cfg), 'protocol_sha256': 'p',
+-              'checkpoint_sha256': 'c', 'protocol_status': 'SERVER_VALIDATION_REQUIRED',
+-              'frames': [{'members': ['m1', 'm2'], 'forward_encoders': ['m2', 'm1'],
+-                          'sample_idx': 0, 'requested': 2, 'realized': 2, 'input_cav_ids': ['a', 'b'],
+-                          'in_range_cav_ids': ['a', 'b'], 'scene': 's', 'timestamp': 't',
+-                          'gt_count': 1, 'gt_sha256': 'a' * 64}],
+-              'statistics': {key: {'gt': 1} for key in ('0.3', '0.5', '0.7')}, 'AP': ap}
+-    (directory / 'result.json').write_text(json.dumps(report))
+-    encoder = {'assembled_sha256': 'c', 'calls': ['m2', 'm1'], 'unique_members': ['m1', 'm2']}
+-    (directory / 'forward_encoders.json').write_text(json.dumps(encoder))
+-    with (directory / 'ap.csv').open('w', newline='') as stream:
+-        writer = csv.writer(stream)
+-        writer.writerow(['CAV', 'AP@0.3', 'AP@0.5', 'AP@0.7'])
+-        writer.writerow([2, .3, .2, .1])
+-    namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
+-    encoder['calls'].append('m4')
+-    (directory / 'forward_encoders.json').write_text(json.dumps(encoder))
+-    with pytest.raises(ValueError, match='Encoder participation'):
+-        namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
+-    report['AP']['AP@0.5'] = 1.1
+-    (directory / 'result.json').write_text(json.dumps(report))
+-    (directory / 'forward_encoders.json').write_text(json.dumps(dict(encoder, calls=['m2', 'm1'])))
+-    with pytest.raises(ValueError, match='Invalid AP'):
+-        namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
+-
+-
+-def test_summary_checks_ap_identity_and_ranges(tmp_path):
+-    final = tmp_path / 'final_infer'
+-    final.mkdir()
+-    ap = {'AP@0.3': .3, 'AP@0.5': .2, 'AP@0.7': .1}
+-    results = [{'dataset': 'v2xset', 'protocol_sha256': 'p', 'checkpoint_sha256': 'c',
+-                'protocol_status': 'SERVER_VALIDATION_REQUIRED', 'AP': dict(ap),
+-                'frames': [{'scene': 's', 'gt_sha256': 'g', 'members': ['m1']}]} for _ in range(4)]
+-    entries = [{'CAV': i, 'frames': 1, 'protocol_status': 'SERVER_VALIDATION_REQUIRED', 'AP': dict(ap)}
+-               for i in range(1, 5)]
+-    (final / 'AP_CAV1_4.json').write_text(json.dumps(entries))
+-    with (final / 'AP_CAV1_4.csv').open('w', newline='') as stream:
+-        writer = csv.writer(stream)
+-        writer.writerow(['CAV', 'AP@0.3', 'AP@0.5', 'AP@0.7'])
+-        writer.writerows([[i, .3, .2, .1] for i in range(1, 5)])
+-    namespace['check_summary'](tmp_path, results)
+-    results[3]['frames'][0]['gt_sha256'] = 'wrong'
+-    with pytest.raises(ValueError, match='frame'):
+-        namespace['check_summary'](tmp_path, results)
+-
+-
+-def saved_pair(exp, stage, last, best):
+-    for name, epoch in (('last.pth', last), ('best.pth', best)):
+-        path = exp / stage / name
+-        path.write_text(json.dumps({'epoch': epoch}))
+-        Path(str(path) + '.sha256').write_text(namespace['file_sha'](path))
+-
+-
+-def oom_experiment(tmp_path, monkeypatch, target):
+-    root, exp, records = fake_experiment(tmp_path, monkeypatch)
+-    original_check = namespace['checkpoint_check']
+-    checked = []
+-
+-    def strict_check(root, exp, stage, configs, name, full=False):
+-        checked.append((stage, name))
+-        if stage == target:
+-            path = exp / stage / name
+-            if path.is_file() and path.read_bytes().startswith(b'{'):
+-                if Path(str(path) + '.sha256').read_text() != namespace['file_sha'](path):
+-                    raise ValueError('Checkpoint SHA256 mismatch')
+-                info = original_check(root, exp, stage, configs, name, full)
+-                info['epoch'] = json.loads(path.read_text())['epoch']
+-                return info
+-        return original_check(root, exp, stage, configs, name, full)
+-
+-    monkeypatch.setitem(namespace, 'checkpoint_check', strict_check)
+-    return root, exp, records, checked
+-
+-
+-def test_historical_m4_accepted_without_training_and_remains_parent(tmp_path, monkeypatch):
+-    root, exp, records, checked = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
+-    for stage in namespace['TRAIN'][:3]:
+-        saved_pair(exp, stage, namespace['EXPECTED'][stage][1], namespace['EXPECTED'][stage][1])
+-    saved_pair(exp, 'pretrain/m4', 23, 22)
+-    directory = exp / 'pretrain/m4'
+-    (directory / 'train.log').write_text('CUDA out of memory after epoch 23')
+-    (directory / 'orchestrator_pretrain_m4.log').write_text('historical OOM')
+-    (directory / 'tensorboard').mkdir()
+-    (directory / 'tensorboard/events.test').write_bytes(b'events')
+-    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+-    namespace['main'](root, exp, True)
+-    assert records[0] == ('alliance/nego', False)
+-    assert not any(stage == 'pretrain/m4' for stage, _ in records)
+-    assert ('m4/align', False) in records and ('pretrain/m4', 'best.pth') in checked
+-    state = json.loads((exp / 'orchestrator_state.json').read_text())
+-    entry = state['stages']['pretrain/m4']
+-    assert entry['status'] == 'partial_accepted'
+-    assert (entry['completed_epoch'], entry['best_epoch'], entry['batch_size']) == (23, 22, 4)
+-    assert state['status'] == 'complete_with_partial'
+-    archive = exp / entry['oom_archive']
+-    assert (archive / 'artifacts/tensorboard/events.test').read_bytes() == b'events'
+-    assert (archive / 'audit.json').is_file()
+-    assert all((directory / name).read_bytes() == value for name, value in before.items())
+-    records.clear()
+-    namespace['main'](root, exp, True)
+-    assert records == []
+-    assert json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m4'] == entry
+-
+-
+-@pytest.mark.parametrize('tamper', ['checkpoint', 'audit', 'config_identity'])
+-def test_partial_acceptance_is_revalidated(tmp_path, monkeypatch, tamper):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
+-    saved_pair(exp, 'pretrain/m4', 23, 22)
+-    namespace['main'](root, exp, True)
+-    state_path = exp / 'orchestrator_state.json'
+-    state = json.loads(state_path.read_text())
+-    entry = state['stages']['pretrain/m4']
+-    if tamper == 'checkpoint':
+-        (exp / 'pretrain/m4/best.pth').write_text('{"epoch":21}')
+-    elif tamper == 'audit':
+-        (exp / entry['oom_archive'] / 'audit.json').write_text('{}')
+-    else:
+-        entry['config_sha'] = 'wrong'
+-        state_path.write_text(json.dumps(state))
+-    records.clear()
+-    with pytest.raises(ValueError):
+-        namespace['main'](root, exp, True)
+-    assert records == []
+-
+-
+-def install_oom_attempts(monkeypatch, exp, target, records, epochs, error='CUDA out of memory', corrupt=False):
+-    base_run = namespace['subprocess'].run
+-    batches = []
+-    outcomes = iter(epochs)
+-
+-    def attempt(command, cwd, stdout, stderr, env=None):
+-        if '--stage' not in command or command[command.index('--stage') + 1] != target:
+-            return base_run(command, cwd, stdout, stderr, env=env)
+-        batch = int(env['NEGO_RUNTIME_BATCH_SIZE'])
+-        batches.append((batch, '--resume' in command))
+-        epoch = next(outcomes)
+-        if epoch is None:
+-            return base_run(command, cwd, stdout, stderr, env=env)
+-        records.append((target, '--resume' in command))
+-        saved_pair(exp, target, epoch, max(1, epoch - 1))
+-        if corrupt:
+-            (exp / target / 'last.pth.sha256').write_text('wrong')
+-        stdout.write('Traceback\nRuntimeError: ' + error + '\n')
+-        stdout.flush()
+-        return SimpleNamespace(returncode=1)
+-
+-    monkeypatch.setattr(namespace['subprocess'], 'run', attempt)
+-    return batches
+-
+-
+-def test_oom_batch_8_4_2_1_and_official_resume(tmp_path, monkeypatch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5, 6, 7, None])
+-    namespace['main'](root, exp, False)
+-    assert batches == [(8, False), (4, True), (2, True), (1, True)]
+-    entry = json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m3']
+-    assert entry['status'] == 'complete' and entry['retry_count'] == 3
+-    assert [attempt['batch_size'] for attempt in entry['oom_attempts']] == [8, 4, 2]
+-    assert all((exp / item['archive'] / 'artifacts/last.pth').is_file() for item in entry['oom_attempts'])
+-
+-
+-@pytest.mark.parametrize('epoch', [20, 23])
+-def test_oom_epoch_boundary(tmp_path, monkeypatch, epoch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m1')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m1', records, [epoch, None])
+-    namespace['main'](root, exp, False)
+-    state = json.loads((exp / 'orchestrator_state.json').read_text())
+-    entry = state['stages']['pretrain/m1']
+-    if epoch == 20:
+-        assert batches == [(4, False), (2, True)] and entry['status'] == 'complete'
+-    else:
+-        assert batches == [(4, False)] and entry['status'] == 'partial_accepted'
+-        assert entry['completed_epoch'] == 23 and entry['best_epoch'] == 22
+-        assert records[1] == ('pretrain/m2', False)
+-
+-
+-def test_batch_one_oom_stops_and_preserves_artifacts(tmp_path, monkeypatch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5, 6, 7, 8])
+-    with pytest.raises(RuntimeError, match='cannot be retried safely'):
+-        namespace['main'](root, exp, False)
+-    assert [batch for batch, _ in batches] == [8, 4, 2, 1]
+-    assert not any(stage == 'pretrain/m4' for stage, _ in records)
+-    entry = json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m3']
+-    assert entry['status'] == 'failed' and len(entry['oom_attempts']) == 4
+-    assert (exp / 'pretrain/m3/best.pth').is_file() and (exp / 'pretrain/m3/last.pth').is_file()
+-
+-
+-@pytest.mark.parametrize('error,corrupt', [('bad input data', False), ('CUDA out of memory', True)])
+-def test_non_oom_or_corrupt_checkpoint_does_not_retry(tmp_path, monkeypatch, error, corrupt):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5], error=error, corrupt=corrupt)
+-    with pytest.raises((RuntimeError, ValueError)):
+-        namespace['main'](root, exp, False)
+-    assert batches == [(8, False)]
+-    assert not any(stage == 'pretrain/m4' for stage, _ in records)
+-
+-
+-def test_m4_never_retries_at_reduced_batch(tmp_path, monkeypatch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m4', records, [20])
+-    with pytest.raises(ValueError, match='must not be retrained'):
+-        namespace['main'](root, exp, False)
+-    assert batches == [(4, False)]
+-
+-
+-def test_old_oom_in_appended_log_does_not_trigger_retry(tmp_path, monkeypatch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
+-    saved_pair(exp, 'pretrain/m3', 5, 4)
+-    (exp / 'pretrain/m3/orchestrator_pretrain_m3.log').write_text('Old CUDA out of memory\n')
+-    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5], error='invalid input data')
+-    with pytest.raises(RuntimeError, match='Stage failed'):
+-        namespace['main'](root, exp, True)
+-    assert batches == [(8, True)]
+-    assert not (exp / 'validation').exists()
+-
+-
+-def test_m4_wrong_best_epoch_refuses_training(tmp_path, monkeypatch):
+-    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
+-    saved_pair(exp, 'pretrain/m4', 23, 21)
+-    with pytest.raises(ValueError, match='last=23, best=22'):
+-        namespace['main'](root, exp, True)
+-    assert not any(stage in ('pretrain/m4', 'alliance/nego') for stage, _ in records)
++"""Isolated orchestration tests: no dataset, CUDA, or training subprocesses."""
++import ast
++import csv
++import json
++import os
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SCRIPT = ROOT / 'scripts/run_nego_v2xset_doma_r2.sh'
++source = SCRIPT.read_text(encoding='utf-8')
++python_source = source.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
++namespace = {'__name__': 'orchestrator_test'}
++exec(compile(python_source, str(SCRIPT), 'exec'), namespace)
++
++
++def test_python38_and_bash_syntax():
++    def parse(text):
++        if sys.version_info[:2] > (3, 8):
++            return ast.parse(text, feature_version=(3, 8))
++        return ast.parse(text)
++    tree = parse(python_source)
++    for node in ast.walk(tree):
++        if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ('probe', 'code') for t in node.targets)
++                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
++            parse(node.value.value)
++    bash = os.environ.get('NEGO_TEST_BASH', 'bash')
++    subprocess.run([bash, '-n', str(SCRIPT)], check=True)
++
++
++def test_train_start_and_reject_logs_or_checkpoints(tmp_path):
++    stage = 'pretrain/m1'
++    directory = tmp_path / stage
++    directory.mkdir(parents=True)
++    (directory / 'config.yaml').write_text('config')
++    decision = namespace['train_decision']
++    assert decision(tmp_path, stage, 31, False, None) == 'start'
++    (directory / 'train.log').write_text('old')
++    with pytest.raises(FileExistsError):
++        decision(tmp_path, stage, 31, False, None)
++    with pytest.raises(ValueError, match='without last'):
++        decision(tmp_path, stage, 31, True, None)
++
++
++def test_resume_skip_and_incomplete_checkpoints(tmp_path):
++    stage = 'pretrain/m1'
++    directory = tmp_path / stage
++    directory.mkdir(parents=True)
++    (directory / 'last.pth').write_bytes(b'last')
++    check = lambda stage, name, full: {'epoch': 3 if name == 'last.pth' else 2}
++    decision = namespace['train_decision']
++    assert decision(tmp_path, stage, 4, True, check) == 'resume'
++    with pytest.raises(ValueError, match='lacks best'):
++        decision(tmp_path, stage, 3, True, check)
++    (directory / 'best.pth').write_bytes(b'best')
++    assert decision(tmp_path, stage, 3, True, check) == 'skip'
++    assert decision(tmp_path, stage, 2, True, check) == 'skip'
++    (directory / 'last.pth.tmp').write_bytes(b'partial')
++    with pytest.raises(ValueError, match='Incomplete checkpoint'):
++        decision(tmp_path, stage, 3, True, check)
++
++
++def test_resume_does_not_ignore_strict_loader_failure(tmp_path):
++    directory = tmp_path / 'pretrain/m1'
++    directory.mkdir(parents=True)
++    (directory / 'last.pth').write_bytes(b'corrupt')
++    def reject(stage, name, full):
++        raise ValueError('Checkpoint SHA256 mismatch/missing sidecar')
++    with pytest.raises(ValueError, match='SHA256'):
++        namespace['train_decision'](tmp_path, 'pretrain/m1', 31, True, reject)
++
++
++def test_independent_audited_configuration_manifest(tmp_path, monkeypatch):
++    configs = {}
++    for stage, (batch, epochs, lr, prefix) in namespace['EXPECTED'].items():
++        configs[stage] = {'seed': 303, 'train_params': {'batch_size': batch, 'epoches': epochs},
++                          'optimizer': {'lr': lr}, 'fake_sha': prefix + '0' * 52,
++                          'nego_protocol': {'dataset': 'v2xset', 'stage': stage,
++                                            'parents': namespace['parents'](stage)},
++                          'nego': {'multi_batch': {'enabled': stage.startswith('pretrain/'),
++                                                   'mode': 'vectorized' if stage.startswith('pretrain/') else 'native'}}}
++    monkeypatch.setitem(namespace, 'read_yaml', lambda path: configs[Path(path).parent.relative_to(tmp_path).as_posix()])
++    monkeypatch.setitem(namespace, 'digest', lambda cfg: cfg['fake_sha'])
++    monkeypatch.setitem(namespace, 'verify_lock', lambda dataset: None)
++    monkeypatch.setitem(namespace, 'validate_config', lambda cfg: None)
++    monkeypatch.setitem(namespace, 'validate_runtime_batch', lambda cfg: None)
++    assert len(namespace['validate_configs'](tmp_path)) == 11
++    configs['pretrain/m3']['train_params']['batch_size'] = 4
++    assert len(namespace['validate_configs'](tmp_path)) == 11
++    configs['pretrain/m3']['train_params']['batch_size'] = 8
++    configs['pretrain/m3']['nego_protocol']['stage'] = 'pretrain/m2'
++    with pytest.raises(ValueError, match='pretrain/m3'):
++        namespace['validate_configs'](tmp_path)
++
++
++def fake_experiment(tmp_path, monkeypatch, fail=None):
++    root = tmp_path / 'root'
++    exp = root / 'exp'
++    exp.mkdir(parents=True)
++    (root / 'lock.yaml').write_text('lock')
++    expected_sha = 'a' * 40
++    monkeypatch.setenv('NEGO_EXPECTED_GIT_SHA', expected_sha)
++    configs = {}
++    for stage in namespace['EXPECTED']:
++        (exp / stage).mkdir(parents=True)
++        (exp / stage / 'config.yaml').write_text('config')
++        configs[stage] = {'stage': stage, 'nego_protocol': {'protocol_lock': 'lock.yaml'},
++                          'train_params': {'batch_size': namespace['EXPECTED'][stage][0],
++                                           'epoches': namespace['EXPECTED'][stage][1]}}
++    monkeypatch.setitem(namespace, 'preflight', lambda root, exp: expected_sha)
++    monkeypatch.setitem(namespace, 'validate_configs', lambda exp: configs)
++    records = []
++    def fake_check(root, exp, stage, configs, name, full=False):
++        assert (exp / stage / name).is_file()
++        provenance = {p: {'sha256': namespace['file_sha'](exp / p / 'best.pth'),
++                          'config_sha': namespace['digest'](configs[p])}
++                      for p in namespace['parents'](stage)}
++        return {'epoch': namespace['EXPECTED'][stage][1] if stage != 'final_infer' else 0,
++                'parents': provenance, 'owners': {}}
++    monkeypatch.setitem(namespace, 'checkpoint_check', fake_check)
++    monkeypatch.setitem(namespace, 'check_result', lambda exp, cav, cfg, cksha, protocol_sha: {'cav': cav})
++    monkeypatch.setitem(namespace, 'check_summary', lambda exp, results: None)
++    def fake_run(command, cwd, stdout, stderr, env=None):
++        args = command[4:]
++        action = args[0]
++        stage = args[args.index('--stage') + 1] if '--stage' in args else action
++        if action == 'infer': stage = 'infer_CAV' + args[args.index('--use-cav') + 1]
++        records.append((stage, '--resume' in args))
++        if stage == fail:
++            return SimpleNamespace(returncode=17)
++        if action == 'train':
++            for name in ('last.pth', 'best.pth'):
++                (exp / stage / name).write_bytes(b'checkpoint')
++                (exp / stage / (name + '.sha256')).write_text('checksum')
++        elif action == 'assemble':
++            path = exp / 'final_infer/assembled.pth'
++            path.write_bytes(b'assembled')
++            Path(str(path) + '.sha256').write_text('checksum')
++            provenance = fake_check(root, exp, 'final_infer', configs, 'assembled.pth')['parents']
++            path.with_suffix('.sources.json').write_text(json.dumps({'parents': provenance, 'owners': {},
++                                                                    'checkpoint_sha256': namespace['file_sha'](path)}))
++        elif action == 'infer':
++            paths = namespace['inference_paths'](exp,int(args[args.index('--use-cav') + 1]))
++            paths['result'].write_text('{}')
++            paths['encoders'].write_text('{}')
++            paths['ap'].write_text('csv')
++        elif action == 'summarize':
++            (exp / 'final_infer/AP_CAV1_4.json').write_text('[]')
++            (exp / 'final_infer/AP_CAV1_4.csv').write_text('csv')
++        return SimpleNamespace(returncode=0)
++    monkeypatch.setattr(namespace['subprocess'], 'run', fake_run)
++    return root, exp, records
++
++
++def test_serial_order_and_resume_completed_skip(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    namespace['main'](root, exp, False)
++    assert [stage for stage, _ in records] == namespace['TRAIN'] + [
++        'assemble', 'infer_CAV1', 'infer_CAV2', 'infer_CAV3', 'infer_CAV4', 'summarize']
++    state = json.loads((exp / 'orchestrator_state.json').read_text())
++    assert state['status'] == 'complete'
++    with pytest.raises(FileExistsError):
++        namespace['main'](root, exp, False)
++    records.clear()
++    namespace['main'](root, exp, True)
++    assert records == []
++
++
++def test_failure_stops_later_stages(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch, fail='pretrain/m2')
++    with pytest.raises(RuntimeError, match='exit 17'):
++        namespace['main'](root, exp, False)
++    assert [stage for stage, _ in records] == ['pretrain/m1', 'pretrain/m2']
++    state = json.loads((exp / 'orchestrator_state.json').read_text())
++    assert state['stages']['pretrain/m2']['exit_code'] == 17
++
++
++def test_incomplete_stage_calls_official_resume(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    directory = exp / 'pretrain/m1'
++    (directory / 'last.pth').write_bytes(b'checkpoint')
++    original = namespace['train_decision']
++    calls = []
++    def decision(exp, stage, epochs, resume, check):
++        if stage == 'pretrain/m1' and len(calls) < 2:
++            calls.append(1)
++            return 'resume'
++        return original(exp, stage, epochs, resume, check)
++    monkeypatch.setitem(namespace, 'train_decision', decision)
++    namespace['main'](root, exp, True)
++    assert records[0] == ('pretrain/m1', True)
++
++
++def test_verified_completed_stage_is_skipped(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    for name in ('last.pth', 'best.pth'):
++        (exp / 'pretrain/m1' / name).write_bytes(b'checkpoint')
++        (exp / 'pretrain/m1' / (name + '.sha256')).write_text('checksum')
++    namespace['main'](root, exp, True)
++    assert records[0] == ('pretrain/m2', False)
++    state = json.loads((exp / 'orchestrator_state.json').read_text())
++    assert state['stages']['pretrain/m1']['disposition'] == 'verified_existing'
++
++
++def test_later_incomplete_stage_stops_before_first_train(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    (exp / 'pretrain/m4/train.log').write_text('old incomplete run')
++    with pytest.raises(ValueError, match='without last'):
++        namespace['main'](root, exp, True)
++    assert records == []
++
++
++def test_lock_conflict_stops_before_python(tmp_path):
++    root = tmp_path / 'repo'
++    scripts = root / 'scripts'
++    scripts.mkdir(parents=True)
++    shutil.copyfile(SCRIPT, scripts / SCRIPT.name)
++    exp = root / 'opencood/logs/NEGO_V2XSET_DOMA_R2_1GPU'
++    exp.mkdir(parents=True)
++    (exp / 'runtime.env').write_text('NEGO_EXPECTED_GIT_SHA=x\nCUDA_VISIBLE_DEVICES=2\n')
++    bin_dir = root / 'bin'
++    bin_dir.mkdir()
++    flock = bin_dir / 'flock'
++    flock.write_text('#!/usr/bin/env bash\nexit 1\n')
++    flock.chmod(0o755)
++    env = os.environ.copy()
++    env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
++    bash = env.get('NEGO_TEST_BASH', 'bash')
++    result = subprocess.run([bash, str(scripts / SCRIPT.name)], env=env, capture_output=True, text=True)
++    assert result.returncode != 0
++    assert 'Experiment lock already held' in result.stderr
++    assert not (exp / 'orchestrator_state.json').exists()
++
++
++def test_partial_inference_is_rejected(tmp_path, monkeypatch):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    namespace['inference_paths'](exp,1)['result'].write_text('{}')
++    with pytest.raises(ValueError, match='partial or unverified'):
++        namespace['main'](root, exp, False)
++    assert records == []
++
++
++def test_inference_result_checks_encoder_and_provenance(tmp_path):
++    directory = tmp_path / 'final_infer'
++    directory.mkdir(parents=True)
++    cfg = {'x': 1}
++    ap = {'AP@0.3': .3, 'AP@0.5': .2, 'AP@0.7': .1}
++    report = {'dataset': 'v2xset', 'stage': 'final_infer', 'requested': 2,
++              'config_sha256': namespace['digest'](cfg), 'protocol_sha256': 'p',
++              'checkpoint_sha256': 'c', 'protocol_status': 'SERVER_VALIDATION_REQUIRED',
++              'frames': [{'members': ['m1', 'm2'], 'forward_encoders': ['m2', 'm1'],
++                          'sample_idx': 0, 'requested': 2, 'realized': 2, 'input_cav_ids': ['a', 'b'],
++                          'in_range_cav_ids': ['a', 'b'], 'scene': 's', 'timestamp': 't',
++                          'gt_count': 1, 'gt_sha256': 'a' * 64}],
++              'statistics': {key: {'gt': 1} for key in ('0.3', '0.5', '0.7')}, 'AP': ap}
++    (directory / 'result_CAV2.json').write_text(json.dumps(report))
++    encoder = {'assembled_sha256': 'c', 'calls': ['m2', 'm1'], 'unique_members': ['m1', 'm2']}
++    (directory / 'forward_encoders_CAV2.json').write_text(json.dumps(encoder))
++    with (directory / 'ap_CAV2.csv').open('w', newline='') as stream:
++        writer = csv.writer(stream)
++        writer.writerow(['CAV', 'AP@0.3', 'AP@0.5', 'AP@0.7'])
++        writer.writerow([2, .3, .2, .1])
++    namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
++    encoder['calls'].append('m4')
++    (directory / 'forward_encoders_CAV2.json').write_text(json.dumps(encoder))
++    with pytest.raises(ValueError, match='Encoder participation'):
++        namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
++    report['AP']['AP@0.5'] = 1.1
++    (directory / 'result_CAV2.json').write_text(json.dumps(report))
++    (directory / 'forward_encoders_CAV2.json').write_text(json.dumps(dict(encoder, calls=['m2', 'm1'])))
++    with pytest.raises(ValueError, match='Invalid AP'):
++        namespace['check_result'](tmp_path, 2, cfg, 'c', 'p')
++
++
++def test_summary_checks_ap_identity_and_ranges(tmp_path):
++    final = tmp_path / 'final_infer'
++    final.mkdir()
++    ap = {'AP@0.3': .3, 'AP@0.5': .2, 'AP@0.7': .1}
++    results = [{'dataset': 'v2xset', 'protocol_sha256': 'p', 'checkpoint_sha256': 'c',
++                'protocol_status': 'SERVER_VALIDATION_REQUIRED', 'AP': dict(ap),
++                'frames': [{'scene': 's', 'gt_sha256': 'g', 'members': ['m1']}]} for _ in range(4)]
++    entries = [{'CAV': i, 'frames': 1, 'protocol_status': 'SERVER_VALIDATION_REQUIRED', 'AP': dict(ap)}
++               for i in range(1, 5)]
++    (final / 'AP_CAV1_4.json').write_text(json.dumps(entries))
++    with (final / 'AP_CAV1_4.csv').open('w', newline='') as stream:
++        writer = csv.writer(stream)
++        writer.writerow(['CAV', 'AP@0.3', 'AP@0.5', 'AP@0.7'])
++        writer.writerows([[i, .3, .2, .1] for i in range(1, 5)])
++    namespace['check_summary'](tmp_path, results)
++    results[3]['frames'][0]['gt_sha256'] = 'wrong'
++    with pytest.raises(ValueError, match='frame'):
++        namespace['check_summary'](tmp_path, results)
++
++
++def saved_pair(exp, stage, last, best):
++    for name, epoch in (('last.pth', last), ('best.pth', best)):
++        path = exp / stage / name
++        path.write_text(json.dumps({'epoch': epoch}))
++        Path(str(path) + '.sha256').write_text(namespace['file_sha'](path))
++
++
++def oom_experiment(tmp_path, monkeypatch, target):
++    root, exp, records = fake_experiment(tmp_path, monkeypatch)
++    original_check = namespace['checkpoint_check']
++    checked = []
++
++    def strict_check(root, exp, stage, configs, name, full=False):
++        checked.append((stage, name))
++        if stage == target:
++            path = exp / stage / name
++            if path.is_file() and path.read_bytes().startswith(b'{'):
++                if Path(str(path) + '.sha256').read_text() != namespace['file_sha'](path):
++                    raise ValueError('Checkpoint SHA256 mismatch')
++                info = original_check(root, exp, stage, configs, name, full)
++                info['epoch'] = json.loads(path.read_text())['epoch']
++                return info
++        return original_check(root, exp, stage, configs, name, full)
++
++    monkeypatch.setitem(namespace, 'checkpoint_check', strict_check)
++    return root, exp, records, checked
++
++
++def test_historical_m4_accepted_without_training_and_remains_parent(tmp_path, monkeypatch):
++    root, exp, records, checked = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
++    for stage in namespace['TRAIN'][:3]:
++        saved_pair(exp, stage, namespace['EXPECTED'][stage][1], namespace['EXPECTED'][stage][1])
++    saved_pair(exp, 'pretrain/m4', 23, 22)
++    directory = exp / 'pretrain/m4'
++    (directory / 'train.log').write_text('CUDA out of memory after epoch 23')
++    (directory / 'orchestrator_pretrain_m4.log').write_text('historical OOM')
++    (directory / 'tensorboard').mkdir()
++    (directory / 'tensorboard/events.test').write_bytes(b'events')
++    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
++    namespace['main'](root, exp, True)
++    assert records[0] == ('alliance/nego', False)
++    assert not any(stage == 'pretrain/m4' for stage, _ in records)
++    assert ('m4/align', False) in records and ('pretrain/m4', 'best.pth') in checked
++    state = json.loads((exp / 'orchestrator_state.json').read_text())
++    entry = state['stages']['pretrain/m4']
++    assert entry['status'] == 'partial_accepted'
++    assert (entry['completed_epoch'], entry['best_epoch'], entry['batch_size']) == (23, 22, 4)
++    assert state['status'] == 'complete_with_partial'
++    archive = exp / entry['oom_archive']
++    assert (archive / 'artifacts/tensorboard/events.test').read_bytes() == b'events'
++    assert (archive / 'audit.json').is_file()
++    assert all((directory / name).read_bytes() == value for name, value in before.items())
++    records.clear()
++    namespace['main'](root, exp, True)
++    assert records == []
++    assert json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m4'] == entry
++
++
++@pytest.mark.parametrize('tamper', ['checkpoint', 'audit', 'config_identity'])
++def test_partial_acceptance_is_revalidated(tmp_path, monkeypatch, tamper):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
++    saved_pair(exp, 'pretrain/m4', 23, 22)
++    namespace['main'](root, exp, True)
++    state_path = exp / 'orchestrator_state.json'
++    state = json.loads(state_path.read_text())
++    entry = state['stages']['pretrain/m4']
++    if tamper == 'checkpoint':
++        (exp / 'pretrain/m4/best.pth').write_text('{"epoch":21}')
++    elif tamper == 'audit':
++        (exp / entry['oom_archive'] / 'audit.json').write_text('{}')
++    else:
++        entry['configuration_identity'] = 'wrong'
++        state_path.write_text(json.dumps(state))
++    records.clear()
++    with pytest.raises(ValueError):
++        namespace['main'](root, exp, True)
++    assert records == []
++
++
++def install_oom_attempts(monkeypatch, exp, target, records, epochs, error='CUDA out of memory', corrupt=False):
++    base_run = namespace['subprocess'].run
++    batches = []
++    outcomes = iter(epochs)
++
++    def attempt(command, cwd, stdout, stderr, env=None):
++        if '--stage' not in command or command[command.index('--stage') + 1] != target:
++            return base_run(command, cwd, stdout, stderr, env=env)
++        batch = int(env['NEGO_RUNTIME_BATCH_SIZE'])
++        batches.append((batch, '--resume' in command))
++        epoch = next(outcomes)
++        if epoch is None:
++            return base_run(command, cwd, stdout, stderr, env=env)
++        records.append((target, '--resume' in command))
++        saved_pair(exp, target, epoch, max(1, epoch - 1))
++        if corrupt:
++            (exp / target / 'last.pth.sha256').write_text('wrong')
++        stdout.write('Traceback\nRuntimeError: ' + error + '\n')
++        stdout.flush()
++        return SimpleNamespace(returncode=1)
++
++    monkeypatch.setattr(namespace['subprocess'], 'run', attempt)
++    return batches
++
++
++def test_oom_batch_8_4_2_1_and_official_resume(tmp_path, monkeypatch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5, 6, 7, None])
++    namespace['main'](root, exp, False)
++    assert batches == [(8, False), (4, True), (2, True), (1, True)]
++    entry = json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m3']
++    assert entry['status'] == 'complete' and entry['retry_count'] == 3
++    assert [attempt['batch_size'] for attempt in entry['oom_attempts']] == [8, 4, 2]
++    assert all((exp / item['archive'] / 'artifacts/last.pth').is_file() for item in entry['oom_attempts'])
++
++
++@pytest.mark.parametrize('epoch', [20, 23])
++def test_oom_epoch_boundary(tmp_path, monkeypatch, epoch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m1')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m1', records, [epoch, None])
++    namespace['main'](root, exp, False)
++    state = json.loads((exp / 'orchestrator_state.json').read_text())
++    entry = state['stages']['pretrain/m1']
++    if epoch == 20:
++        assert batches == [(4, False), (2, True)] and entry['status'] == 'complete'
++    else:
++        assert batches == [(4, False)] and entry['status'] == 'partial_accepted'
++        assert entry['completed_epoch'] == 23 and entry['best_epoch'] == 22
++        assert records[1] == ('pretrain/m2', False)
++
++
++def test_batch_one_oom_stops_and_preserves_artifacts(tmp_path, monkeypatch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5, 6, 7, 8])
++    with pytest.raises(RuntimeError, match='cannot be retried safely'):
++        namespace['main'](root, exp, False)
++    assert [batch for batch, _ in batches] == [8, 4, 2, 1]
++    assert not any(stage == 'pretrain/m4' for stage, _ in records)
++    entry = json.loads((exp / 'orchestrator_state.json').read_text())['stages']['pretrain/m3']
++    assert entry['status'] == 'failed' and len(entry['oom_attempts']) == 4
++    assert (exp / 'pretrain/m3/best.pth').is_file() and (exp / 'pretrain/m3/last.pth').is_file()
++
++
++@pytest.mark.parametrize('error,corrupt', [('bad input data', False), ('CUDA out of memory', True)])
++def test_non_oom_or_corrupt_checkpoint_does_not_retry(tmp_path, monkeypatch, error, corrupt):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5], error=error, corrupt=corrupt)
++    with pytest.raises((RuntimeError, ValueError)):
++        namespace['main'](root, exp, False)
++    assert batches == [(8, False)]
++    assert not any(stage == 'pretrain/m4' for stage, _ in records)
++
++
++def test_m4_never_retries_at_reduced_batch(tmp_path, monkeypatch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m4', records, [20])
++    with pytest.raises(ValueError, match='must not be retrained'):
++        namespace['main'](root, exp, False)
++    assert batches == [(4, False)]
++
++
++def test_old_oom_in_appended_log_does_not_trigger_retry(tmp_path, monkeypatch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m3')
++    saved_pair(exp, 'pretrain/m3', 5, 4)
++    (exp / 'pretrain/m3/orchestrator_pretrain_m3.log').write_text('Old CUDA out of memory\n')
++    batches = install_oom_attempts(monkeypatch, exp, 'pretrain/m3', records, [5], error='invalid input data')
++    with pytest.raises(RuntimeError, match='Stage failed'):
++        namespace['main'](root, exp, True)
++    assert batches == [(8, True)]
++    assert not (exp / 'validation').exists()
++
++
++def test_m4_wrong_best_epoch_refuses_training(tmp_path, monkeypatch):
++    root, exp, records, _ = oom_experiment(tmp_path, monkeypatch, 'pretrain/m4')
++    saved_pair(exp, 'pretrain/m4', 23, 21)
++    with pytest.raises(ValueError, match='last=23, best=22'):
++        namespace['main'](root, exp, True)
++    assert not any(stage in ('pretrain/m4', 'alliance/nego') for stage, _ in records)
